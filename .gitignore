@@ -1,0 +1,11 @@
+node_modules/
+dist/
+release/
+coverage/
+research/
+
+.DS_Store
+*.log
+.env
+.env.*
+.npmrc

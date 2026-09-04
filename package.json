@@ -1,0 +1,67 @@
+{
+  "name": "mortiphi",
+  "version": "0.4.0",
+  "private": false,
+  "description": "A focused local browser GUI for Muse Code",
+  "keywords": [
+    "muse-code",
+    "coding-agent",
+    "developer-tools",
+    "gui"
+  ],
+  "homepage": "https://github.com/Aeroknight786/mortiphi#readme",
+  "bugs": {
+    "url": "https://github.com/Aeroknight786/mortiphi/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Aeroknight786/mortiphi.git"
+  },
+  "type": "module",
+  "bin": {
+    "mortiphi": "dist/cli/index.js"
+  },
+  "files": [
+    "dist/client",
+    "dist/cli",
+    "dist/server",
+    "dist/shared",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "dev": "NODE_ENV=development tsx watch src/server/index.ts",
+    "start": "NODE_ENV=development tsx src/server/index.ts",
+    "build": "node scripts/clean-dist.mjs && vite build && tsc -p tsconfig.server.json",
+    "serve": "NODE_ENV=production node dist/server/index.js",
+    "prepack": "npm run build",
+    "pack:check": "npm pack --dry-run",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:integration": "tsx scripts/muse-smoke.ts",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.server.json --noEmit"
+  },
+  "dependencies": {
+    "@fontsource/commit-mono": "5.3.0",
+    "@muse-code/sdk": "0.1.1",
+    "express": "5.2.1",
+    "marked": "16.3.0",
+    "preact": "10.29.8"
+  },
+  "devDependencies": {
+    "@preact/preset-vite": "2.10.2",
+    "@testing-library/preact": "3.2.4",
+    "@types/express": "5.0.3",
+    "@types/node": "24.5.2",
+    "jsdom": "27.0.0",
+    "tsx": "4.20.5",
+    "typescript": "5.9.2",
+    "vite": "7.3.6",
+    "vitest": "3.2.7"
+  }
+}
