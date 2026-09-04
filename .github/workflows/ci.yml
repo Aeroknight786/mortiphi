@@ -67,15 +67,11 @@ jobs:
         run: npm audit --audit-level=high
 
       - name: Create npm tarball
-        id: pack
-        shell: bash
-        run: |
-          package_path="$(npm pack --silent)"
-          echo "path=$package_path" >> "$GITHUB_OUTPUT"
+        run: npm pack
 
       - name: Install the packed CLI
         shell: bash
         run: |
-          npm install --global --prefix "$RUNNER_TEMP/mortiphi" "${{ steps.pack.outputs.path }}"
+          npm install --global --prefix "$RUNNER_TEMP/mortiphi" ./mortiphi-*.tgz
           "$RUNNER_TEMP/mortiphi/bin/mortiphi" --version
           "$RUNNER_TEMP/mortiphi/bin/mortiphi" --help
