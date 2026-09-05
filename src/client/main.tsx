@@ -228,8 +228,9 @@ function TaskHeader({ session, snapshot, detailOpen, setDetailOpen, onCommand }:
   const [menu, setMenu] = useState(false);
   const menuRef = useDismissableLayer<HTMLDivElement>(menu, () => setMenu(false));
   const state = sessionState(snapshot);
+  const stage = transientStage(snapshot, state);
   const actions = [["fork","Fork task"],["rename","Rename task"],["clear","New task in this project"],["compact","Compact context"],["copy","Copy last response"],["delete","Remove task"]];
-  return <header class="task-header"><div><span class="eyebrow">{folderName(String(snapshot.session.workspaceRoot ?? ""))}</span><h1>{session?.title ?? titleFrom(snapshot.items)}</h1></div><div class="header-actions">{state !== "idle" && <span class={`state-pill ${state}`}>{statusLabel(state)}</span>}<button class={`details-button ${detailOpen ? "selected" : ""}`} onClick={() => setDetailOpen(!detailOpen)} aria-label="Toggle details">Details</button><div ref={menuRef} class="menu-wrap"><button class="icon-button" onClick={() => setMenu(!menu)} aria-haspopup="menu" aria-expanded={menu}>•••</button>{menu && <div class="popover menu" role="menu">{actions.map(([id,label]) => <button class={id === "delete" ? "danger-action" : ""} role="menuitem" onClick={() => { setMenu(false); void onCommand(id!); }}>{label}</button>)}</div>}</div></div></header>;
+  return <header class="task-header"><div><span class="eyebrow">{folderName(String(snapshot.session.workspaceRoot ?? ""))}</span><h1>{session?.title ?? titleFrom(snapshot.items)}</h1></div><div class="header-actions">{state !== "idle" && <span class={`state-pill ${state}`}><span>{statusLabel(state)}</span>{stage && <small>· {stage}</small>}</span>}<button class={`details-button ${detailOpen ? "selected" : ""}`} onClick={() => setDetailOpen(!detailOpen)} aria-label="Toggle details">Details</button><div ref={menuRef} class="menu-wrap"><button class="icon-button" onClick={() => setMenu(!menu)} aria-haspopup="menu" aria-expanded={menu}>•••</button>{menu && <div class="popover menu" role="menu">{actions.map(([id,label]) => <button class={id === "delete" ? "danger-action" : ""} role="menuitem" onClick={() => { setMenu(false); void onCommand(id!); }}>{label}</button>)}</div>}</div></div></header>;
 }
 
 function Transcript({ snapshot, sessionId, onRefresh, setError }: { snapshot: SessionProjectionSnapshot; sessionId: string; onRefresh: () => void; setError: (e: ApiError) => void }) {
@@ -283,7 +284,7 @@ function LiveTurnStatus({ snapshot }: { snapshot: SessionProjectionSnapshot }) {
   const [now, setNow] = useState(Date.now());
   useEffect(() => { const timer = window.setInterval(() => setNow(Date.now()), 1000); return () => window.clearInterval(timer); }, []);
   const activeId = snapshot.state.activeTurnId;
-  const latest = [...snapshot.items].reverse().find((item) => item.turnId === activeId && ["reasoning", "toolCall", "userShell", "agentMessage", "subagent", "workflow"].includes(String(item.kind)));
+  const latest = latestLiveItem(snapshot);
   const updated = new Date(String(snapshot.session.updatedAt ?? "")).getTime();
   const quietSeconds = Number.isFinite(updated) ? Math.max(0, Math.floor((now - updated) / 1000)) : 0;
   const label = snapshot.pending.approvals.length ? "Waiting for your permission" : snapshot.pending.userInputs.length ? "Waiting for your answer" : liveActivityLabel(latest);
@@ -459,6 +460,8 @@ function summarizeActivity(items: Json[]) { const groups=new Map<string,{name:st
 function fileBase64(file: File) { return new Promise<string>((resolve,reject)=>{const reader=new FileReader();reader.onload=()=>resolve(String(reader.result).split(",")[1]??"");reader.onerror=()=>reject(reader.error);reader.readAsDataURL(file);}); }
 function eventAnnouncement(event: Json) { if(event.method==="turn/completed")return `Muse turn ${event.params?.terminal??"completed"}.`;if(event.method==="turn/retracted")return "Prompt retracted and restored to the composer.";if(event.method.startsWith("approval/"))return "Muse needs permission.";if(event.method.startsWith("userInput/"))return "Muse has a question.";return "Muse state updated."; }
 function liveActivityLabel(item?: Json) { if(!item)return "Working";if(item.kind==="reasoning")return item.status==="inProgress"?"Reasoning":"Continuing";if(item.kind==="agentMessage")return item.status==="inProgress"?"Writing a response":"Finishing";if(item.kind==="toolCall"||item.kind==="userShell"){const name=String(item.tool??item.kind);return item.status==="inProgress"?`Running ${name}`:`Finished ${name}; continuing`;}if(item.kind==="subagent"||item.kind==="workflow")return `${capitalize(String(item.kind))} ${item.status??"running"}`;return "Working"; }
+function latestLiveItem(snapshot: SessionProjectionSnapshot) { const activeId=snapshot.state.activeTurnId;return [...snapshot.items].reverse().find((item)=>item.turnId===activeId&&["reasoning","toolCall","userShell","agentMessage","subagent","workflow"].includes(String(item.kind))); }
+function transientStage(snapshot: SessionProjectionSnapshot, state: string) { if(state==="waiting")return snapshot.pending.approvals.length?"approval":"question";if(state==="queued")return "next";if(state!=="running")return null;const item=latestLiveItem(snapshot);if(!item)return "starting";if(item.kind==="reasoning")return "reasoning";if(item.kind==="agentMessage")return "writing";if(item.kind==="userShell")return "shell";if(item.kind==="toolCall")return String(item.tool??"tool").replaceAll("_"," ");if(item.kind==="subagent")return "subagent";if(item.kind==="workflow")return "workflow";return null; }
 
 document.documentElement.dataset.theme = localStorage.getItem("mortiphi:theme") ?? "system";
 const root = document.getElementById("app")!;
