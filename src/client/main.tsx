@@ -75,13 +75,18 @@ function App() {
   useEffect(() => {
     if (!activeId || !snapshot) return;
     setSessions((all) => all.map((session) => session.sessionId === activeId ? { ...session, title: session.titleSource === "mortiphi" ? session.title : titleFrom(snapshot.items), status: sessionState(snapshot) as SessionSummary["status"], activeTurnId: snapshot.state.activeTurnId, updatedAt: String(snapshot.session.updatedAt ?? session.updatedAt) } : session));
-  }, [activeId, snapshot?.revision]);
+  }, [activeId, snapshot]);
 
   const refreshSnapshot = async (id = activeId) => {
     if (!id) return;
     try { setSnapshot(await api.snapshot(id)); }
     catch (e) { setError(normalize(e)); }
   };
+  useEffect(() => {
+    if (!activeId || !snapshot?.state.activeTurnId) return;
+    const timer = window.setInterval(() => void refreshSnapshot(activeId), 2500);
+    return () => window.clearInterval(timer);
+  }, [activeId, snapshot?.state.activeTurnId]);
   useEffect(() => {
     if (!activeId || !snapshot) return;
     const source = new EventSource(`/api/sessions/${activeId}/events?afterRevision=${snapshot.revision}`);
@@ -205,7 +210,7 @@ function Project({ project, activeId, onChoose, onTaskAction }: { project: Proje
   const [taskMenu, setTaskMenu] = useState<string | null>(null);
   const menuRef = useDismissableLayer<HTMLDivElement>(Boolean(taskMenu), () => setTaskMenu(null));
   return <section class="project-group"><button class="project-row" onClick={toggle} aria-expanded={open}><span class="chevron">{open ? "⌄" : "›"}</span><span title={project.workspaceRoot}>{project.name}</span><small>{project.sessions.length}</small></button>
-    {open && <div class="task-list">{project.sessions.map((session) => { const actions = [["fork","Fork task"],["rename","Rename task"],["compact","Compact context"],["copy-id","Copy task ID"],["new","New task in this project"],["delete","Remove task"]]; return <div ref={taskMenu === session.sessionId ? menuRef : undefined} class="task-row-wrap" key={session.sessionId}><button class={`task-row ${activeId === session.sessionId ? "active" : ""}`} onClick={() => onChoose(session)}><span class={`status-dot ${session.status}`} aria-hidden="true"/><span class="task-copy"><strong>{session.title}</strong><small>{session.available ? session.status === "idle" ? relativeTime(session.updatedAt) : `${statusLabel(session.status)} · ${relativeTime(session.updatedAt)}` : "Workspace unavailable"}</small></span></button><button class="task-more" aria-label={`Actions for ${session.title}`} onClick={() => setTaskMenu(taskMenu === session.sessionId ? null : session.sessionId)}>•••</button>{taskMenu === session.sessionId && <div class="task-popover" role="menu">{actions.map(([id,label]) => <button class={id === "delete" ? "danger-action" : ""} role="menuitem" disabled={!session.available && !["copy-id","delete"].includes(id!)} onClick={() => { setTaskMenu(null); void onTaskAction(id!, session); }}>{label}</button>)}</div>}</div>; })}</div>}
+    {open && <div class="task-list">{project.sessions.map((session) => { const actions = [["fork","Fork task"],["rename","Rename task"],["compact","Compact context"],["copy-id","Copy task ID"],["new","New task in this project"],["delete","Remove task"]]; const active = activeId === session.sessionId; return <div ref={taskMenu === session.sessionId ? menuRef : undefined} class={`task-row-wrap ${active ? "active" : ""}`} key={session.sessionId}><button class="task-row" aria-current={active ? "page" : undefined} onClick={() => onChoose(session)}><span class={`status-dot ${session.status}`} aria-hidden="true"/><span class="task-copy"><strong>{session.title}</strong><small>{session.available ? session.status === "idle" ? relativeTime(session.updatedAt) : `${statusLabel(session.status)} · ${relativeTime(session.updatedAt)}` : "Workspace unavailable"}</small></span></button><button class="task-more" aria-label={`Actions for ${session.title}`} onClick={() => setTaskMenu(taskMenu === session.sessionId ? null : session.sessionId)}>•••</button>{taskMenu === session.sessionId && <div class="task-popover" role="menu">{actions.map(([id,label]) => <button class={id === "delete" ? "danger-action" : ""} role="menuitem" disabled={!session.available && !["copy-id","delete"].includes(id!)} onClick={() => { setTaskMenu(null); void onTaskAction(id!, session); }}>{label}</button>)}</div>}</div>; })}</div>}
   </section>;
 }
 

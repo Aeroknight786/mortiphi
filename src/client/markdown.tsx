@@ -3,7 +3,24 @@ import { Marked, Renderer } from "marked";
 const renderer = new Renderer();
 renderer.html = () => "";
 renderer.code = ({ text, lang }) => `<div class="code-block"><button class="copy-code" type="button" data-copy="${encodeURIComponent(text)}">Copy</button><pre><code class="language-${lang?.replace(/[^\w-]/g, "") ?? "text"}">${escapeHtml(text)}</code></pre></div>`;
-const parser = new Marked({ renderer, breaks: true, gfm: true });
+const renderStrikethrough = renderer.del;
+renderer.del = function(token) {
+  if (!token.raw.startsWith("~~")) return escapeHtml(token.raw);
+  return renderStrikethrough.call(this, token);
+};
+const parser = new Marked({
+  renderer,
+  breaks: true,
+  gfm: true,
+  tokenizer: {
+    del(source) {
+      if (source.startsWith("~~")) return false;
+      const singleTilde = /^~(?!~)(?=\S)([\s\S]*?\S)(?<!~)~(?!~)/.exec(source);
+      if (!singleTilde) return false;
+      return { type: "del", raw: singleTilde[0], text: singleTilde[0], tokens: [] };
+    },
+  },
+});
 
 export function markdown(text: string) {
   let html: string;
