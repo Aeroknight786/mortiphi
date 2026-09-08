@@ -74,6 +74,13 @@ export function createHttpApp(bridge: MuseBridge, workspaces = new WorkspaceRegi
     const projection = await bridge.attach(param(req, "id"));
     res.json(projection.snapshot());
   }));
+  app.post("/api/sessions/:id/resync", asyncHandler(async (req, res) => {
+    const projection = await bridge.resync(param(req, "id"));
+    res.json(projection.snapshot());
+  }));
+  app.get("/api/health", asyncHandler(async (_req, res) => {
+    res.json({ ...bridge.health(), museBin: process.env.MUSE_BIN ?? "muse" });
+  }));
   app.get("/api/sessions/:id/events", asyncHandler(async (req, res) => {
     const projection = await bridge.attach(param(req, "id"));
     bridge.retain(param(req, "id"));

@@ -11,6 +11,7 @@ const KNOWN = new Set([
 
 export class SessionProjection {
   revision = 0;
+  readOnly = false;
   session: Record<string, unknown>;
   private itemOrder: string[] = [];
   private itemsById = new Map<string, Record<string, unknown>>();
@@ -183,6 +184,7 @@ export class SessionProjection {
   snapshot(): SessionProjectionSnapshot {
     return {
       revision: this.revision,
+      readOnly: this.readOnly,
       session: { ...this.session, activeTurnId: this.state.activeTurnId },
       items: this.itemOrder.map((id) => this.itemsById.get(id)!).filter(Boolean),
       turns: [...this.turnsById.values()],

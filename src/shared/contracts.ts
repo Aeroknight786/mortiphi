@@ -31,6 +31,14 @@ export interface BootstrapResponse {
   defaults: { modelId: string | null; effort: ReasoningEffort; approvalMode: ApprovalMode };
 }
 
+export interface HealthStatus {
+  connected: boolean;
+  reconnectAttempt: number;
+  reconnectScheduled: boolean;
+  subscriptions: number;
+  pendingReattach: string[];
+}
+
 export interface ActionDefinition {
   id: string;
   command: `/${string}`;
@@ -56,6 +64,8 @@ export interface SessionSummary {
   turnCount: number;
   forkedFrom?: string | null;
   available: boolean;
+  readOnly?: boolean;
+  unopenableReason?: string | null;
 }
 
 export interface SessionListResponse {
@@ -79,6 +89,7 @@ export interface ProjectionEvent {
 
 export interface SessionProjectionSnapshot {
   revision: number;
+  readOnly?: boolean;
   session: Record<string, unknown>;
   items: Array<Record<string, unknown>>;
   turns: Array<Record<string, unknown>>;

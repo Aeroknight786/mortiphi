@@ -1,4 +1,4 @@
-import type { BootstrapResponse, SessionListResponse, SessionProjectionSnapshot, TurnInputPart, WorkspaceChanges } from "../shared/contracts";
+import type { BootstrapResponse, HealthStatus, SessionListResponse, SessionProjectionSnapshot, TurnInputPart, WorkspaceChanges } from "../shared/contracts";
 
 let csrf = "";
 
@@ -44,6 +44,8 @@ export const api = {
   sessions: (cursor?: string) => request<SessionListResponse>(`/api/sessions${cursor ? `?cursor=${encodeURIComponent(cursor)}` : ""}`),
   resume: (id: string) => request<SessionProjectionSnapshot>(`/api/sessions/${encodeURIComponent(id)}/resume`, { method: "POST", body: "{}" }, 45_000),
   snapshot: (id: string) => request<SessionProjectionSnapshot>(`/api/sessions/${encodeURIComponent(id)}/snapshot`, {}, 45_000),
+  resync: (id: string) => request<SessionProjectionSnapshot>(`/api/sessions/${encodeURIComponent(id)}/resync`, { method: "POST", body: "{}" }, 45_000),
+  health: () => request<HealthStatus>("/api/health", {}, 10_000),
   openWorkspace: (path: string) => request<any>("/api/workspaces/open", { method: "POST", body: JSON.stringify({ path }) }),
   newSession: (workspaceRoot: string, modelId?: string | null, approvalMode?: string) => request<any>("/api/sessions", { method: "POST", body: JSON.stringify({ workspaceRoot, modelId, approvalMode }) }),
   fork: (id: string) => request<any>(`/api/sessions/${id}/fork`, { method: "POST", body: "{}" }),
