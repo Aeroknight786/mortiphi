@@ -71,13 +71,22 @@ export function createHttpApp(bridge: MuseBridge, workspaces = new WorkspaceRegi
     res.json(projection.snapshot());
   }));
   app.get("/api/sessions/:id/snapshot", asyncHandler(async (req, res) => {
-    const projection = await bridge.attach(param(req, "id"));
+    const existing = bridge.getProjection(param(req, "id"));
+    const projection = existing && !bridge.isConnected() ? existing : await bridge.attach(param(req, "id"));
     res.json(projection.snapshot());
   }));
+  app.post("/api/sessions/:id/resync", asyncHandler(async (req, res) => {
+    const projection = await bridge.resync(param(req, "id"));
+    res.json(projection.snapshot());
+  }));
+  app.get("/api/health", asyncHandler(async (_req, res) => {
+    res.json({ ...bridge.health(), museBin: process.env.MUSE_BIN ?? "muse" });
+  }));
   app.get("/api/sessions/:id/events", asyncHandler(async (req, res) => {
-    const projection = await bridge.attach(param(req, "id"));
+    const existing = bridge.getProjection(param(req, "id"));
+    const projection = existing && !bridge.isConnected() ? existing : await bridge.attach(param(req, "id"));
     bridge.retain(param(req, "id"));
-    const after = Number(query(req, "afterRevision") ?? 0);
+    const after = Number(req.get("Last-Event-ID") ?? query(req, "afterRevision") ?? 0);
     if (!Number.isSafeInteger(after) || after < 0) throw new AppError("invalid_revision", "afterRevision must be a non-negative integer.");
     res.status(200);
     res.setHeader("Content-Type", "text/event-stream");

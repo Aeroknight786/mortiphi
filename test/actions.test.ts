@@ -15,6 +15,6 @@ describe("shared action registry", () => {
 
   it("contains the complete Gate 1 command vocabulary", () => {
     const expected = ["/new","/resume","/fork","/rename","/delete","/clear","/compact","/model","/effort","/permissions","/stop","/copy","/help","/queue","/steer","/replace","/unqueue","/tasks","/details","/changes","/activity","/settings"];
-    expect([...ACTION_BY_COMMAND.keys()].sort()).toEqual(expected.sort());
+    expect([...ACTION_BY_COMMAND.keys()].sort()).toEqual([...expected, "/resync"].sort());
   });
 });

@@ -37,7 +37,7 @@
   "scripts": {
     "dev": "NODE_ENV=development tsx watch src/server/index.ts",
     "start": "NODE_ENV=development tsx src/server/index.ts",
-    "build": "node scripts/clean-dist.mjs && vite build && tsc -p tsconfig.server.json",
+    "build": "node scripts/clean-dist.mjs && vite build && tsc -p tsconfig.server.json && chmod +x dist/cli/index.js",
     "serve": "NODE_ENV=production node dist/server/index.js",
     "prepack": "npm run build",
     "pack:check": "npm pack --dry-run",

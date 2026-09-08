@@ -2,7 +2,7 @@ import "@fontsource/commit-mono/400.css";
 import "@fontsource/commit-mono/600.css";
 import { render } from "preact";
 import { useEffect, useErrorBoundary, useMemo, useRef, useState } from "preact/hooks";
-import type { ActionDefinition, BootstrapResponse, ProjectSummary, ReasoningEffort, SessionProjectionSnapshot, SessionSummary, TurnInputPart, WorkspaceChanges } from "../shared/contracts";
+import type { ActionDefinition, BootstrapResponse, HealthStatus, ProjectSummary, ReasoningEffort, SessionProjectionSnapshot, SessionSummary, TurnInputPart, WorkspaceChanges } from "../shared/contracts";
 import { api, ApiError, bootstrap } from "./api";
 import { Dialog } from "./components/Dialog";
 import { DiffViewer, type DiffResult } from "./components/DiffViewer";
@@ -10,13 +10,14 @@ import { ProjectChangesCard } from "./components/ProjectChangesCard";
 import { extractEditedPaths } from "./diff";
 import { useDismissableLayer } from "./hooks/useDismissableLayer";
 import { handleMarkdownClick, markdown } from "./markdown";
+import { connectionLabel, readTabDraft, scrollAnchorKey, statusLabel, tabDraftId, taskSubtitle } from "./ui-state";
 import "./styles.css";
 
 type Json = Record<string, any>;
 type DetailTab = "overview" | "changes" | "activity";
 type TranscriptBlock = { key: string; turnId: string | null; items: Json[] };
 const EFFORTS: ReasoningEffort[] = ["none", "minimal", "low", "medium", "high", "xhigh", "ultra"];
-const FAILED_TURN_STATES = new Set(["failed", "error", "cancelled", "canceled", "aborted", "timedOut", "timed_out"]);
+const FAILED_TURN_STATES = new Set(["failed", "error", "cancelled", "canceled", "aborted", "timedOut", "timed_out", "stale"]);
 const MODES = [
   { value: "promptUnmatched", label: "Untrusted", detail: "Ask when no rule matches" },
   { value: "onRequest", label: "On request", detail: "Ask when an action requests approval" },
@@ -38,6 +39,7 @@ function App() {
   const [renameTarget, setRenameTarget] = useState<SessionSummary | null>(null);
   const [removeTarget, setRemoveTarget] = useState<SessionSummary | null>(null);
   const [error, setError] = useState<ApiError | null>(null);
+  const [health, setHealth] = useState<HealthStatus | null>(null);
   const [loading, setLoading] = useState(true);
   const [opening, setOpening] = useState<SessionSummary | null>(null);
   const [announcement, setAnnouncement] = useState("");
@@ -62,6 +64,16 @@ function App() {
       finally { setLoading(false); }
     })();
   }, []);
+  const refreshHealth = async () => {
+    try { setHealth(await api.health()); }
+    catch { setHealth({ connected: false, reconnectAttempt: 0, reconnectScheduled: true, subscriptions: 0, inFlightCommands: [], pendingReattach: [] }); }
+  };
+  useEffect(() => {
+    if (!boot) return;
+    void refreshHealth();
+    const timer = window.setInterval(() => void refreshHealth(), 15_000);
+    return () => window.clearInterval(timer);
+  }, [boot]);
   useEffect(() => {
     const key = (event: KeyboardEvent) => { if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "n") { event.preventDefault(); setDialog("new"); } };
     document.addEventListener("keydown", key); return () => document.removeEventListener("keydown", key);
@@ -77,32 +89,42 @@ function App() {
     setSessions((all) => all.map((session) => session.sessionId === activeId ? { ...session, title: session.titleSource === "mortiphi" ? session.title : titleFrom(snapshot.items), status: sessionState(snapshot) as SessionSummary["status"], activeTurnId: snapshot.state.activeTurnId, updatedAt: String(snapshot.session.updatedAt ?? session.updatedAt) } : session));
   }, [activeId, snapshot]);
 
-  const refreshSnapshot = async (id = activeId) => {
+  const snapshotRef = useRef<SessionProjectionSnapshot | null>(null);
+  snapshotRef.current = snapshot;
+  const activeIdRef = useRef<string | null>(null);
+  activeIdRef.current = activeId;
+  useEffect(() => { setError(null); }, [activeId]);
+  const refreshSnapshot = async (id = activeIdRef.current) => {
     if (!id) return;
-    try { setSnapshot(await api.snapshot(id)); }
-    catch (e) { setError(normalize(e)); }
+    try { const next = await api.snapshot(id); if (activeIdRef.current === id) setSnapshot((prev) => !prev || next.revision >= prev.revision ? next : prev); }
+    catch (e) { if (activeIdRef.current === id) setError(normalize(e)); }
   };
   useEffect(() => {
-    if (!activeId || !snapshot?.state.activeTurnId) return;
-    const timer = window.setInterval(() => void refreshSnapshot(activeId), 2500);
-    return () => window.clearInterval(timer);
-  }, [activeId, snapshot?.state.activeTurnId]);
-  useEffect(() => {
-    if (!activeId || !snapshot) return;
-    const source = new EventSource(`/api/sessions/${activeId}/events?afterRevision=${snapshot.revision}`);
+    if (!activeId) return;
+    const id = activeId;
+    const after = snapshotRef.current?.revision ?? 0;
+    const source = new EventSource(`/api/sessions/${id}/events?afterRevision=${after}`);
     const schedule = () => {
-      window.clearTimeout(refreshTimer.current);
-      refreshTimer.current = window.setTimeout(() => void refreshSnapshot(activeId), 45);
+      if (refreshTimer.current !== undefined) return;
+      refreshTimer.current = window.setTimeout(() => { refreshTimer.current = undefined; void refreshSnapshot(id); }, 45);
     };
     source.addEventListener("projection", (event) => {
       const parsed = JSON.parse((event as MessageEvent).data);
+      if (activeIdRef.current !== id) return;
+      if (parsed.method === "morti/hostDisconnected") setSnapshot((prev) => prev ? { ...prev, state: { ...prev.state, connection: "disconnected" } } : prev);
       if (["turn/completed", "turn/retracted", "approval/requested", "userInput/requested"].includes(parsed.method)) setAnnouncement(eventAnnouncement(parsed));
+      applyIncrementalEvent(parsed, setSnapshot);
       schedule();
     });
-    source.addEventListener("resyncRequired", schedule);
-    source.onerror = () => setAnnouncement("Muse connection interrupted. Reconnecting.");
-    return () => { source.close(); window.clearTimeout(refreshTimer.current); };
-  }, [activeId, snapshot?.revision]);
+    source.addEventListener("resyncRequired", () => {
+      void (async () => {
+        try { const next = await api.resync(id); if (activeIdRef.current === id) setSnapshot(next); }
+        catch (e) { if (activeIdRef.current === id) setError(normalize(e)); }
+      })();
+    });
+    source.onerror = () => { setAnnouncement("Muse connection interrupted. Reconnecting."); void refreshHealth(); };
+    return () => { source.close(); window.clearTimeout(refreshTimer.current); refreshTimer.current = undefined; };
+  }, [activeId]);
 
   const projects = useMemo(() => groupProjects(sessions), [sessions]);
   const current = sessions.find((session) => session.sessionId === activeId);
@@ -156,6 +178,7 @@ function App() {
         return openCreated(await api.newSession(root, null, effectiveMode(snapshot)));
       }
       if (id === "compact") { await api.compact(activeId); setAnnouncement("Compaction admitted. Muse will report its result in the transcript."); return; }
+      if (id === "resync") { setSnapshot(await api.resync(activeId)); setAnnouncement("Task resynced from Muse."); return; }
       if (id === "stop" && snapshot?.state.activeTurnId) { await api.stop(activeId, snapshot.state.activeTurnId); setAnnouncement("Stopping. Waiting for Muse to confirm."); return; }
       if (id === "copy") {
         const last = [...(snapshot?.items ?? [])].reverse().find((item) => item.kind === "agentMessage");
@@ -178,13 +201,14 @@ function App() {
       <div class="sidebar-label">Projects</div>
       <nav class="projects">{projects.map((project) => <Project key={project.workspaceRoot} project={project} activeId={activeId} onChoose={chooseTask} onTaskAction={taskAction} />)}</nav>
       {nextCursor && <button class="quiet-button load-more" onClick={() => void loadSessions(nextCursor)}>Show more tasks</button>}
-      <button class="profile-button" onClick={() => setDialog("settings")}><span><strong>Settings</strong><small>{boot?.diagnostics.connected ? "Connected" : "Unavailable"}</small></span><span>⌄</span></button>
+      <button class="profile-button" onClick={() => setDialog("settings")}><span><strong>Settings</strong><small>{connectionLabel(health, boot?.diagnostics.connected ?? false)}</small></span><span>⌄</span></button>
     </aside>
     <main class="workspace">
       {snapshot && activeId ? <>
         <TaskHeader session={current} snapshot={snapshot} detailOpen={detailOpen} setDetailOpen={setDetailOpen} onCommand={command} />
+        {snapshot.readOnly && <div class="warning-note" role="status">Muse can't resume this task, so it's read-only. <button class="quiet-button" onClick={() => void command("resync")}>Resync</button> <button class="quiet-button" onClick={() => void command("fork")}>Fork to continue</button></div>}
         <div class={`work-grid ${compactLayout ? "compact-layout" : ""}`} style={{ gridTemplateColumns: detailOpen && !compactLayout ? `minmax(0, 1fr) ${detailWidth}px` : "1fr" }}>
-          <section class="conversation"><Transcript snapshot={snapshot} sessionId={activeId} onRefresh={() => void refreshSnapshot()} setError={setError} /><Composer sessionId={activeId} snapshot={snapshot} onCommand={command} onSnapshot={() => void refreshSnapshot()} setError={setError} /></section>
+          <section class="conversation"><Transcript snapshot={snapshot} sessionId={activeId} onRefresh={() => void refreshSnapshot()} setError={setError} /><Composer key={activeId} sessionId={activeId} snapshot={snapshot} readOnly={snapshot.readOnly} onCommand={command} onSnapshot={() => void refreshSnapshot()} setError={setError} /></section>
           {detailOpen && <Details sessionId={activeId} snapshot={snapshot} tab={detailTab} setTab={setDetailTab} setError={setError} onResize={(width) => { setDetailWidth(width); localStorage.setItem("mortiphi:detail-width", String(width)); }} />}
         </div>
       </> : <Welcome onNew={() => setDialog("new")} sessions={sessions} onChoose={chooseTask} />}
@@ -210,7 +234,7 @@ function Project({ project, activeId, onChoose, onTaskAction }: { project: Proje
   const [taskMenu, setTaskMenu] = useState<string | null>(null);
   const menuRef = useDismissableLayer<HTMLDivElement>(Boolean(taskMenu), () => setTaskMenu(null));
   return <section class="project-group"><button class="project-row" onClick={toggle} aria-expanded={open}><span class="chevron">{open ? "⌄" : "›"}</span><span title={project.workspaceRoot}>{project.name}</span><small>{project.sessions.length}</small></button>
-    {open && <div class="task-list">{project.sessions.map((session) => { const actions = [["fork","Fork task"],["rename","Rename task"],["compact","Compact context"],["copy-id","Copy task ID"],["new","New task in this project"],["delete","Remove task"]]; const active = activeId === session.sessionId; return <div ref={taskMenu === session.sessionId ? menuRef : undefined} class={`task-row-wrap ${active ? "active" : ""}`} key={session.sessionId}><button class="task-row" aria-current={active ? "page" : undefined} onClick={() => onChoose(session)}><span class={`status-dot ${session.status}`} aria-hidden="true"/><span class="task-copy"><strong>{session.title}</strong><small>{session.available ? session.status === "idle" ? relativeTime(session.updatedAt) : `${statusLabel(session.status)} · ${relativeTime(session.updatedAt)}` : "Workspace unavailable"}</small></span></button><button class="task-more" aria-label={`Actions for ${session.title}`} onClick={() => setTaskMenu(taskMenu === session.sessionId ? null : session.sessionId)}>•••</button>{taskMenu === session.sessionId && <div class="task-popover" role="menu">{actions.map(([id,label]) => <button class={id === "delete" ? "danger-action" : ""} role="menuitem" disabled={!session.available && !["copy-id","delete"].includes(id!)} onClick={() => { setTaskMenu(null); void onTaskAction(id!, session); }}>{label}</button>)}</div>}</div>; })}</div>}
+    {open && <div class="task-list">{project.sessions.map((session) => { const actions = [["fork","Fork task"],["rename","Rename task"],["compact","Compact context"],["copy-id","Copy task ID"],["new","New task in this project"],["delete","Remove task"]]; const active = activeId === session.sessionId; return <div ref={taskMenu === session.sessionId ? menuRef : undefined} class={`task-row-wrap ${active ? "active" : ""}`} key={session.sessionId}><button class="task-row" aria-current={active ? "page" : undefined} onClick={() => onChoose(session)}><span class={`status-dot ${session.status}`} aria-hidden="true"/><span class="task-copy"><strong>{session.title}</strong><small>{taskSubtitle(session)}</small></span></button><button class="task-more" aria-label={`Actions for ${session.title}`} onClick={() => setTaskMenu(taskMenu === session.sessionId ? null : session.sessionId)}>•••</button>{taskMenu === session.sessionId && <div class="task-popover" role="menu">{actions.map(([id,label]) => <button class={id === "delete" ? "danger-action" : ""} role="menuitem" disabled={!session.available && !["copy-id","delete"].includes(id!)} onClick={() => { setTaskMenu(null); void onTaskAction(id!, session); }}>{label}</button>)}</div>}</div>; })}</div>}
   </section>;
 }
 
@@ -229,16 +253,53 @@ function TaskHeader({ session, snapshot, detailOpen, setDetailOpen, onCommand }:
   const menuRef = useDismissableLayer<HTMLDivElement>(menu, () => setMenu(false));
   const state = sessionState(snapshot);
   const stage = transientStage(snapshot, state);
-  const actions = [["fork","Fork task"],["rename","Rename task"],["clear","New task in this project"],["compact","Compact context"],["copy","Copy last response"],["delete","Remove task"]];
+  const actions = [["fork","Fork task"],["rename","Rename task"],["clear","New task in this project"],["resync","Refresh task"],["compact","Compact context"],["copy","Copy last response"],["delete","Remove task"]];
   return <header class="task-header"><div><span class="eyebrow">{folderName(String(snapshot.session.workspaceRoot ?? ""))}</span><h1>{session?.title ?? titleFrom(snapshot.items)}</h1></div><div class="header-actions">{state !== "idle" && <span class={`state-pill ${state}`}><span>{statusLabel(state)}</span>{stage && <small>· {stage}</small>}</span>}<button class={`details-button ${detailOpen ? "selected" : ""}`} onClick={() => setDetailOpen(!detailOpen)} aria-label="Toggle details">Details</button><div ref={menuRef} class="menu-wrap"><button class="icon-button" onClick={() => setMenu(!menu)} aria-haspopup="menu" aria-expanded={menu}>•••</button>{menu && <div class="popover menu" role="menu">{actions.map(([id,label]) => <button class={id === "delete" ? "danger-action" : ""} role="menuitem" onClick={() => { setMenu(false); void onCommand(id!); }}>{label}</button>)}</div>}</div></div></header>;
 }
 
 function Transcript({ snapshot, sessionId, onRefresh, setError }: { snapshot: SessionProjectionSnapshot; sessionId: string; onRefresh: () => void; setError: (e: ApiError) => void }) {
   const end = useRef<HTMLDivElement>(null);
+  const scroller = useRef<HTMLDivElement>(null);
+  const atBottomRef = useRef(true);
+  const restoredRef = useRef<string | null>(null);
+  const saveTimer = useRef<number>();
   const failedTurns = authoritativeFailedTurns(snapshot);
   const blocks = transcriptBlocks(snapshot.items);
-  useEffect(() => end.current?.scrollIntoView({ block: "end" }), [snapshot.items.length, snapshot.items.at(-1)?.text, snapshot.pending.approvals.length]);
-  return <div class="transcript" onClick={(e) => handleMarkdownClick(e as unknown as MouseEvent)}>{snapshot.items.length === 0 && <div class="empty-transcript"><span>φ</span><h2>What are we building?</h2><p>Describe the outcome. Add files with @ or images with the attachment button.</p></div>}
+  useEffect(() => {
+    const el = scroller.current;
+    if (!el) return;
+    const persist = () => {
+      const nearBottom = isNearBottom(el);
+      atBottomRef.current = nearBottom;
+      if (nearBottom) { localStorage.removeItem(scrollAnchorKey(sessionId)); return; }
+      const anchor = firstVisibleItemId(el);
+      if (anchor) localStorage.setItem(scrollAnchorKey(sessionId), anchor);
+    };
+    // atBottomRef tracks synchronously so a streaming chunk landing between
+    // scroll and the debounced write can't act on a stale true; only the
+    // storage write is debounced.
+    const onScroll = () => { atBottomRef.current = isNearBottom(el); window.clearTimeout(saveTimer.current); saveTimer.current = window.setTimeout(persist, 150); };
+    atBottomRef.current = isNearBottom(el);
+    el.addEventListener("scroll", onScroll, { passive: true });
+    return () => { el.removeEventListener("scroll", onScroll); window.clearTimeout(saveTimer.current); persist(); };
+  }, [sessionId]);
+  useEffect(() => {
+    if (restoredRef.current === sessionId || snapshot.items.length === 0) return;
+    restoredRef.current = sessionId;
+    const anchor = localStorage.getItem(scrollAnchorKey(sessionId));
+    const target = anchor ? findAnchorItem(scroller.current, anchor) : null;
+    if (target) { atBottomRef.current = false; target.scrollIntoView({ block: "start" }); return; }
+    // Anchor missing (compacted away or never rendered): drop it so it can't
+    // shadow a future position, then bottom — the only place left to go.
+    if (anchor) localStorage.removeItem(scrollAnchorKey(sessionId));
+    atBottomRef.current = true;
+    end.current?.scrollIntoView({ block: "end" });
+  }, [sessionId, snapshot.items.length]);
+  useEffect(() => {
+    if (restoredRef.current !== sessionId || !atBottomRef.current) return;
+    end.current?.scrollIntoView({ block: "end" });
+  }, [sessionId, snapshot.items.length, snapshot.items.at(-1)?.text, snapshot.pending.approvals.length]);
+  return <div ref={scroller} class="transcript" onClick={(e) => handleMarkdownClick(e as unknown as MouseEvent)}>{snapshot.items.length === 0 && <div class="empty-transcript"><span>φ</span><h2>What are we building?</h2><p>Describe the outcome. Add files with @ or images with the attachment button.</p></div>}
     {blocks.map((block) => <TranscriptBlockView key={block.key} block={block} sessionId={sessionId} activeTurnId={snapshot.state.activeTurnId} queuedTurnIds={snapshot.state.queuedTurns.map((turn) => String(turn.turnId))} setError={setError}/>)}
     {failedTurns.map((turn) => <TurnNotice key={String(turn.turnId)} title="Could not complete this prompt" detail={String(turn.reason ?? turn.message ?? `Turn ended as ${turn.state}.`)} />)}
     {snapshot.pending.approvals.map((approval) => <ApprovalCard key={String(approval.approvalId)} approval={approval} sessionId={sessionId} onRefresh={onRefresh} setError={setError} />)}
@@ -271,9 +332,9 @@ function SafeItemView({ item }: { item: Json }) {
 }
 
 function ItemView({ item }: { item: Json }) {
-  if (item.kind === "userMessage") return <article class={`message user ${item.retracted ? "retracted" : ""}`}><div class="message-label">You {item.steered && <span>· steering</span>}{item.retracted && <span>· retracted</span>}</div><div class="message-body" dangerouslySetInnerHTML={markdown(String(item.text ?? ""))}/>{Array.isArray(item.attachments) && item.attachments.length > 0 && <small>{item.attachments.length} image attachment{item.attachments.length > 1 ? "s" : ""}</small>}</article>;
-  if (item.kind === "agentMessage") return <article class="message agent"><div class="message-body" dangerouslySetInnerHTML={markdown(String(item.text ?? ""))}/>{item.truncated && <div class="warning-note">Earlier output is shortened in this view. The full output remains in the session.</div>}</article>;
-  return <details class="activity-item unknown"><summary><span>?</span> {item.kind ?? "Unknown item"} <small>{item.status ?? "unknown"}</small></summary><p>{item.fallbackText ?? item.text ?? "This item kind is newer than mortiφ. It remains preserved in the session."}</p></details>;
+  if (item.kind === "userMessage") return <article class={`message user ${item.retracted ? "retracted" : ""}`} data-item-id={item.itemId ?? undefined}><div class="message-label">You {item.steered && <span>· steering</span>}{item.retracted && <span>· retracted</span>}</div><div class="message-body" dangerouslySetInnerHTML={markdown(String(item.text ?? ""))}/>{Array.isArray(item.attachments) && item.attachments.length > 0 && <small>{item.attachments.length} image attachment{item.attachments.length > 1 ? "s" : ""}</small>}</article>;
+  if (item.kind === "agentMessage") return <article class="message agent" data-item-id={item.itemId ?? undefined}><div class="message-body" dangerouslySetInnerHTML={markdown(String(item.text ?? ""))}/>{item.truncated && <div class="warning-note">Earlier output is shortened in this view. The full output remains in the session.</div>}</article>;
+  return <details class="activity-item unknown" data-item-id={item.itemId ?? undefined}><summary><span>?</span> {item.kind ?? "Unknown item"} <small>{item.status ?? "unknown"}</small></summary><p>{item.fallbackText ?? item.text ?? "This item kind is newer than mortiφ. It remains preserved in the session."}</p></details>;
 }
 
 function TurnNotice({ title, detail, prompt }: { title: string; detail: string; prompt?: string }) {
@@ -287,14 +348,17 @@ function LiveTurnStatus({ snapshot }: { snapshot: SessionProjectionSnapshot }) {
   const latest = latestLiveItem(snapshot);
   const updated = new Date(String(snapshot.session.updatedAt ?? "")).getTime();
   const quietSeconds = Number.isFinite(updated) ? Math.max(0, Math.floor((now - updated) / 1000)) : 0;
-  const label = snapshot.pending.approvals.length ? "Waiting for your permission" : snapshot.pending.userInputs.length ? "Waiting for your answer" : liveActivityLabel(latest);
-  const detail = quietSeconds >= 10 ? `Still working · ${quietSeconds}s since the last update` : latest ? null : "Starting…";
+  const connected = snapshot.state.connection === "connected";
+  const label = !connected ? "Reconnecting" : snapshot.pending.approvals.length ? "Waiting for your permission" : snapshot.pending.userInputs.length ? "Waiting for your answer" : liveActivityLabel(latest);
+  const detail = !connected ? "Waiting for the connection to return." : quietSeconds >= 10 ? `Still working · ${quietSeconds}s since the last update` : latest ? null : "Starting…";
   return <div class={`live-turn ${quietSeconds >= 10 ? "quiet" : ""}`} aria-label="Task in progress"><span class="live-pulse" aria-hidden="true"/><div><strong>{label}</strong>{detail && <small>{detail}</small>}</div></div>;
 }
 
-function Composer({ sessionId, snapshot, onCommand, onSnapshot, setError }: { sessionId: string; snapshot: SessionProjectionSnapshot; onCommand: (id: string, args?: string) => void; onSnapshot: () => void; setError: (e: ApiError) => void }) {
-  const draftKey = `mortiphi:draft:${sessionId}`;
-  const [text, setText] = useState(() => localStorage.getItem(draftKey) ?? "");
+function Composer({ sessionId, snapshot, readOnly, onCommand, onSnapshot, setError }: { sessionId: string; snapshot: SessionProjectionSnapshot; readOnly?: boolean; onCommand: (id: string, args?: string) => void; onSnapshot: () => void; setError: (e: ApiError) => void }) {
+  const [tabId] = useState(tabDraftId);
+  const legacyDraftKey = `mortiphi:draft:${sessionId}`;
+  const draftKey = `${legacyDraftKey}:${tabId}`;
+  const [text, setText] = useState(() => readTabDraft(draftKey, legacyDraftKey));
   const [effort, setEffort] = useState<ReasoningEffort>(() => (localStorage.getItem("mortiphi:effort") as ReasoningEffort) || "high");
   const [mode, setMode] = useState<"queue" | "steer" | "replace">("queue");
   const [images, setImages] = useState<TurnInputPart[]>([]);
@@ -333,6 +397,7 @@ function Composer({ sessionId, snapshot, onCommand, onSnapshot, setError }: { se
     }, [active, snapshot.state.stoppingTurnId, snapshot.turns.length]);
 
   const submit = async (forcedMode = mode, forcedText = text) => {
+    if (readOnly) { setError(new ApiError("session_readonly", "This task is read-only.", false, "Fork the task to keep working.")); return; }
     const trimmed = forcedText.trim(); if ((!trimmed && images.length === 0) || busy) return;
     const [token, ...rest] = trimmed.split(/\s+/);
     const action = (actions ?? []).find((a) => a.command === token);
@@ -382,8 +447,8 @@ function Composer({ sessionId, snapshot, onCommand, onSnapshot, setError }: { se
     {matches.length > 0 && <div class="command-palette" role="listbox">{matches.map((action, index) => <button role="option" aria-selected={index === cmdIndex} class={index === cmdIndex ? "selected" : ""} onMouseDown={(e) => e.preventDefault()} onClick={() => { setText(""); setCommandDismissed(true); void onCommand(action.id); }}><span><strong>{action.command}</strong> {action.label}</span><small>{action.source} · {action.gui}</small></button>)}</div>}
     {filePicker && <div class="file-palette"><input autoFocus value={fileQuery} onInput={(e) => void findFiles(e.currentTarget.value)} placeholder="Find a workspace file…" />{files.map((path) => <button onClick={() => { setText((t) => `${t}${t && !t.endsWith(" ") ? " " : ""}@${path} `); setFilePicker(false); inputRef.current?.focus(); }}>{path}</button>)}</div>}
     {images.length > 0 && <div class="attachment-strip">{images.map((image, i) => image.type === "image" && <div class="attachment"><img src={`data:${image.mediaType};base64,${image.base64Data}`} alt={`Attachment ${i + 1}`} /><button onClick={() => setImages((all) => all.filter((_, n) => n !== i))} aria-label="Remove attachment">×</button></div>)}</div>}
-    <div class="composer"><textarea ref={inputRef} value={text} onInput={(e) => { setText(e.currentTarget.value); setCommandDismissed(false); setFilePicker(false); }} onKeyDown={keydown as any} placeholder={active ? "Guide the running task, or type / for commands" : "Ask to build, fix, or explain…  / for commands"} rows={3}/>
-      <div class="composer-tools"><div class="tool-left"><label class="attach-button" title="Attach up to four images"><span>＋</span><input type="file" multiple accept="image/png,image/jpeg,image/webp,image/gif" onChange={(e) => void addImages(e.currentTarget.files)} /></label><button onClick={() => { setCommandDismissed(true); setFilePicker(!filePicker); if (!filePicker) void findFiles(""); }} title="Mention a workspace file">@</button><button class={`permissions-control ${effectiveMode(snapshot)==="allowAll"?"broad":""}`} onClick={() => { setFilePicker(false); setCommandDismissed(true); void onCommand("permissions"); }} title="Choose permissions"><span class="permission-symbol">!</span>{modeLabel(effectiveMode(snapshot))}</button></div><div class="tool-right"><div class="turn-configurator" aria-label="Model and reasoning effort"><button onClick={() => { setFilePicker(false); setCommandDismissed(true); void onCommand("model"); }} title="Choose model">{String(snapshot.state.model?.modelId ?? snapshot.session.modelId ?? "Muse default").replace(/^muse-/, "")}</button><select value={effort} onChange={(e) => { const value = e.currentTarget.value as ReasoningEffort; setEffort(value); localStorage.setItem("mortiphi:effort", value); }} aria-label="Reasoning effort">{EFFORTS.map((v) => <option value={v}>{effortLabel(v)}</option>)}</select></div>{active && <select value={mode} onChange={(e) => setMode(e.currentTarget.value as any)} aria-label="Active turn behavior"><option value="queue">Queue</option><option value="steer">Steer</option><option value="replace">Replace…</option></select>}<button class={`send-button ${primaryIsStop ? "is-stop" : ""}`} disabled={primaryIsStop ? stopping : busy || !hasDraft} onClick={() => void primaryAction()} aria-label={primaryIsStop ? stopping ? "Stopping task" : "Stop task" : busy ? "Sending" : "Send"}>{primaryIsStop ? <span class="stop-glyph" aria-hidden="true"/> : busy ? "…" : "↑"}</button></div></div>
+    <div class="composer"><textarea ref={inputRef} value={text} disabled={readOnly} onInput={(e) => { setText(e.currentTarget.value); setCommandDismissed(false); setFilePicker(false); }} onKeyDown={keydown as any} placeholder={readOnly ? "Read-only task — fork to keep working" : active ? "Guide the running task, or type / for commands" : "Ask to build, fix, or explain…  / for commands"} rows={3}/>
+      <div class="composer-tools"><div class="tool-left"><label class="attach-button" title="Attach up to four images"><span>＋</span><input type="file" multiple accept="image/png,image/jpeg,image/webp,image/gif" onChange={(e) => void addImages(e.currentTarget.files)} /></label><button onClick={() => { setCommandDismissed(true); setFilePicker(!filePicker); if (!filePicker) void findFiles(""); }} title="Mention a workspace file">@</button><button class={`permissions-control ${effectiveMode(snapshot)==="allowAll"?"broad":""}`} onClick={() => { setFilePicker(false); setCommandDismissed(true); void onCommand("permissions"); }} title="Choose permissions"><span class="permission-symbol">!</span>{modeLabel(effectiveMode(snapshot))}</button></div><div class="tool-right"><div class="turn-configurator" aria-label="Model and reasoning effort"><button onClick={() => { setFilePicker(false); setCommandDismissed(true); void onCommand("model"); }} title="Choose model">{String(snapshot.state.model?.modelId ?? snapshot.session.modelId ?? "Muse default").replace(/^muse-/, "")}</button><select value={effort} onChange={(e) => { const value = e.currentTarget.value as ReasoningEffort; setEffort(value); localStorage.setItem("mortiphi:effort", value); }} aria-label="Reasoning effort">{EFFORTS.map((v) => <option value={v}>{effortLabel(v)}</option>)}</select></div>{active && <select value={mode} onChange={(e) => setMode(e.currentTarget.value as any)} aria-label="Active turn behavior"><option value="queue">Queue</option><option value="steer">Steer</option><option value="replace">Replace…</option></select>}<button class={`send-button ${primaryIsStop ? "is-stop" : ""}`} disabled={readOnly || (primaryIsStop ? stopping : busy || !hasDraft)} onClick={() => void primaryAction()} aria-label={primaryIsStop ? stopping ? "Stopping task" : "Stop task" : busy ? "Sending" : "Send"}>{primaryIsStop ? <span class="stop-glyph" aria-hidden="true"/> : busy ? "…" : "↑"}</button></div></div>
     </div></div>;
 }
 
@@ -441,9 +506,7 @@ function groupProjects(sessions: SessionSummary[]): ProjectSummary[] { const map
 function normalize(error: unknown) { return error instanceof ApiError ? error : new ApiError("unexpected_error", error instanceof Error ? error.message : String(error), true, "Retry. If it persists, restart mortiφ."); }
 function folderName(path: string) { return path.split(/[\\/]/).filter(Boolean).at(-1) ?? "Project"; }
 function titleFrom(items: Json[]) { const item=items.find((i)=>i.kind==="userMessage"&&!i.retracted); return item?.text ? String(item.text).replace(/\s+/g," ").slice(0,68) : "New task"; }
-function statusLabel(status: string) { return ({running:"Running",queued:"Queued",waiting:"Waiting",failed:"Failed",idle:"Idle"} as Json)[status] ?? status; }
 function gitStatusLabel(status: string) { const value=status.trim();if(status==="??")return "New";if(value.includes("R"))return "Renamed";if(value.includes("D"))return "Deleted";if(value.includes("A"))return "Added";if(value.includes("M"))return "Modified";if(value.includes("C"))return "Copied";return value||"Changed"; }
-function relativeTime(value: string) { const ms=Date.now()-new Date(value).getTime();if(!Number.isFinite(ms))return "time unavailable";const min=Math.floor(ms/60000);if(min<1)return "now";if(min<60)return `${min}m ago`;const hrs=Math.floor(min/60);if(hrs<24)return `${hrs}h ago`;return `${Math.floor(hrs/24)}d ago`; }
 function formatDate(value: string) { const date=new Date(value); return Number.isFinite(date.getTime())?date.toLocaleString():"Unavailable"; }
 function formatNumber(value: unknown) { const number=Number(value??0); return Number.isFinite(number)?new Intl.NumberFormat("en",{notation:number>9999?"compact":"standard"}).format(number):"—"; }
 function totalTokens(value: Json) { return Object.values(value).filter((v)=>typeof v==="number").reduce<number>((a,b)=>a+(b as number),0); }
@@ -453,12 +516,33 @@ function modeLabel(value: string) { return MODES.find((m)=>m.value===value)?.lab
 function effectiveMode(snapshot: SessionProjectionSnapshot | null) { return String(snapshot?.state.approvalMode?.mode ?? (snapshot?.session.approvalMode as Json)?.mode ?? "promptUnmatched"); }
 function authoritativeFailedTurns(snapshot: SessionProjectionSnapshot) { return snapshot.turns.filter((turn)=>FAILED_TURN_STATES.has(String(turn.state))); }
 function sessionState(snapshot: SessionProjectionSnapshot) { if(snapshot.state.connection!=="connected")return "failed";if(snapshot.state.activeTurnId)return "running";if(snapshot.pending.approvals.length||snapshot.pending.userInputs.length)return "waiting";if(snapshot.state.queuedTurns.length)return "queued";if(authoritativeFailedTurns(snapshot).length)return "failed";return "idle"; }
+function isNearBottom(el: HTMLElement, tolerance = 48) { return el.scrollHeight - el.scrollTop - el.clientHeight <= tolerance; }
+function firstVisibleItemId(container: HTMLElement) {
+  const top = container.getBoundingClientRect().top;
+  const nodes = container.querySelectorAll("[data-item-id]");
+  for (const node of nodes) if (node.getBoundingClientRect().bottom > top) return node.getAttribute("data-item-id");
+  return null;
+}
+function findAnchorItem(container: HTMLElement | null, anchor: string) {
+  if (!container) return null;
+  const nodes = container.querySelectorAll("[data-item-id]");
+  for (const node of nodes) if (node.getAttribute("data-item-id") === anchor) return node;
+  return null;
+}
 function transcriptBlocks(items: Json[]): TranscriptBlock[] { const raw: TranscriptBlock[]=[];for(const [index,item] of items.entries()){const turnId=typeof item.turnId==="string"?item.turnId:null;const previous=raw.at(-1);if(previous&&previous.turnId===turnId)previous.items.push(item);else raw.push({key:`${turnId??"session"}:${index}`,turnId,items:[item]});}const blocks: TranscriptBlock[]=[];for(const block of raw){const previous=blocks.at(-1);const previousPrompt=previous?.items.find((item)=>item.kind==="userMessage");const nextPrompt=block.items.find((item)=>item.kind==="userMessage");const previousAnswered=previous?.items.some((item)=>item.kind==="agentMessage");if(previous&&previousPrompt&&nextPrompt&&!previousAnswered&&normalizedPrompt(previousPrompt.text)===normalizedPrompt(nextPrompt.text)){previous.items.push(...block.items);previous.turnId=block.turnId;continue;}blocks.push(block);}return blocks; }
 function normalizedPrompt(value: unknown) { return String(value??"").trim().replace(/\s+/g," "); }
 function activityName(item: Json) { if(item.kind==="reasoning")return "Reasoning";if(item.kind==="compaction")return "Context compacted";if(item.kind==="toolCall"||item.kind==="userShell")return String(item.tool??(item.kind==="userShell"?"Shell":"Tool"));if(item.kind==="subagent")return "Subagent";if(item.kind==="workflow")return "Workflow";return String(item.kind??"Activity"); }
 function summarizeActivity(items: Json[]) { const groups=new Map<string,{name:string;count:number;failed:number}>();for(const item of items){const name=activityName(item);const current=groups.get(name)??{name,count:0,failed:0};current.count++;if(item.status==="failed")current.failed++;groups.set(name,current);}return [...groups.values()]; }
 function fileBase64(file: File) { return new Promise<string>((resolve,reject)=>{const reader=new FileReader();reader.onload=()=>resolve(String(reader.result).split(",")[1]??"");reader.onerror=()=>reject(reader.error);reader.readAsDataURL(file);}); }
 function eventAnnouncement(event: Json) { if(event.method==="turn/completed")return `Muse turn ${event.params?.terminal??"completed"}.`;if(event.method==="turn/retracted")return "Prompt retracted and restored to the composer.";if(event.method.startsWith("approval/"))return "Muse needs permission.";if(event.method.startsWith("userInput/"))return "Muse has a question.";return "Muse state updated."; }
+function applyIncrementalEvent(event: Json, setSnapshot: (update: (prev: SessionProjectionSnapshot | null) => SessionProjectionSnapshot | null) => void) {
+  const turnId = typeof (event.params as Json)?.turnId === "string" ? (event.params as Json).turnId as string : null;
+  if (!turnId) return;
+  if (event.method === "turn/started") setSnapshot((prev) => prev ? { ...prev, state: { ...prev.state, activeTurnId: turnId } } : prev);
+  else if (event.method === "turn/completed" || event.method === "turn/retracted" || event.method === "turn/unqueued") {
+    setSnapshot((prev) => prev && prev.state.activeTurnId === turnId ? { ...prev, state: { ...prev.state, activeTurnId: null } } : prev);
+  }
+}
 function liveActivityLabel(item?: Json) { if(!item)return "Working";if(item.kind==="reasoning")return item.status==="inProgress"?"Reasoning":"Continuing";if(item.kind==="agentMessage")return item.status==="inProgress"?"Writing a response":"Finishing";if(item.kind==="toolCall"||item.kind==="userShell"){const name=String(item.tool??item.kind);return item.status==="inProgress"?`Running ${name}`:`Finished ${name}; continuing`;}if(item.kind==="subagent"||item.kind==="workflow")return `${capitalize(String(item.kind))} ${item.status??"running"}`;return "Working"; }
 function latestLiveItem(snapshot: SessionProjectionSnapshot) { const activeId=snapshot.state.activeTurnId;return [...snapshot.items].reverse().find((item)=>item.turnId===activeId&&["reasoning","toolCall","userShell","agentMessage","subagent","workflow"].includes(String(item.kind))); }
 function transientStage(snapshot: SessionProjectionSnapshot, state: string) { if(state==="waiting")return snapshot.pending.approvals.length?"approval":"question";if(state==="queued")return "next";if(state!=="running")return null;const item=latestLiveItem(snapshot);if(!item)return "starting";if(item.kind==="reasoning")return "reasoning";if(item.kind==="agentMessage")return "writing";if(item.kind==="userShell")return "shell";if(item.kind==="toolCall")return String(item.tool??"tool").replaceAll("_"," ");if(item.kind==="subagent")return "subagent";if(item.kind==="workflow")return "workflow";return null; }

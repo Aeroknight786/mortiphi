@@ -59,6 +59,11 @@ mortiphi --muse-bin /absolute/path/to/muse
 
 ## Security
 
+Workspace skills and rules are disabled by default. If you trust the repositories
+you will open, launch with `MORTIPHI_TRUST_WORKSPACE=1 mortiphi` to load their
+skills and rules (including tools that require workspace trust). This applies to
+every session opened by that server process.
+
 The application binds exclusively to `127.0.0.1`, rejects foreign Host and Origin headers, uses a per-launch SameSite session cookie and CSRF token, and authorizes workspace access through canonical Muse session roots. See [SECURITY.md](SECURITY.md) for private vulnerability reporting.
 
 ## Development

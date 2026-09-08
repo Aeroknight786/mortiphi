@@ -3,6 +3,7 @@ import type { ActionDefinition } from "./contracts.js";
 export const ACTIONS: readonly ActionDefinition[] = [
   ["new", "/new", "New task", "Start a fresh Muse session in this project", "Muse", "New task", "always"],
   ["resume", "/resume", "Resume task", "Open an existing Muse session", "Muse", "Task sidebar", "always"],
+  ["resync", "/resync", "Refresh task", "Reload this task's history and live state", "mortiφ", "Task menu", "session"],
   ["fork", "/fork", "Fork task", "Fork this session and preserve its lineage", "Muse", "Task menu", "session"],
   ["rename", "/rename", "Rename task", "Set a local mortiφ label for this task", "mortiφ", "Task menu", "session"],
   ["delete", "/delete", "Remove task", "Remove this task from mortiφ while preserving its Muse session", "mortiφ", "Task menu", "session"],

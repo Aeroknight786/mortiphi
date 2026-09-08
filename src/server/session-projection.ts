@@ -11,6 +11,7 @@ const KNOWN = new Set([
 
 export class SessionProjection {
   revision = 0;
+  readOnly = false;
   session: Record<string, unknown>;
   private itemOrder: string[] = [];
   private itemsById = new Map<string, Record<string, unknown>>();
@@ -18,6 +19,7 @@ export class SessionProjection {
   private approvals = new Map<string, Record<string, unknown>>();
   private userInputs = new Map<string, Record<string, unknown>>();
   private journal: ProjectionEvent[] = [];
+  private seenCursors = new Set<string>();
   private listeners = new Set<(event: ProjectionEvent | { type: "resyncRequired" }) => void>();
   private maxJournal: number;
   needsResync = false;
@@ -51,6 +53,7 @@ export class SessionProjection {
     this.turnsById.clear();
     this.approvals.clear();
     this.userInputs.clear();
+    this.seenCursors.clear();
     this.needsResync = false;
     this.state = {
       activeTurnId: typeof session.activeTurnId === "string" ? session.activeTurnId : null,
@@ -97,6 +100,9 @@ export class SessionProjection {
   }
 
   apply(method: string, params: Record<string, unknown>, emittedAtMs?: number, replay = false) {
+    const cursor = string(params.viewCursor);
+    if (cursor && this.seenCursors.has(cursor)) return;
+    if (cursor) this.seenCursors.add(cursor);
     if (!replay && emittedAtMs) this.session.updatedAt = new Date(emittedAtMs).toISOString();
     if (method === "view/gap") {
       this.needsResync = true;
@@ -169,7 +175,23 @@ export class SessionProjection {
   markStopping(turnId: string) { this.state.stoppingTurnId = turnId; this.publish("morti/turnStopping", { turnId }); }
   disconnect() { this.state.connection = "disconnected"; this.publish("morti/hostDisconnected", {}); }
 
+  // Keep the journal, revision and listeners bound to this session across resync.
+  restore(source: SessionProjection) {
+    this.session = source.session;
+    this.state = source.state;
+    this.itemOrder = source.itemOrder;
+    this.itemsById = source.itemsById;
+    this.turnsById = source.turnsById;
+    this.approvals = source.approvals;
+    this.userInputs = source.userInputs;
+    this.seenCursors = source.seenCursors;
+    this.readOnly = source.readOnly;
+    this.needsResync = source.needsResync;
+    this.publish("morti/resynced", {});
+  }
+
   eventsAfter(afterRevision: number) {
+    if (afterRevision > this.revision) return null;
     const oldest = this.journal[0]?.revision ?? this.revision + 1;
     if (afterRevision < oldest - 1) return null;
     return this.journal.filter((event) => event.revision > afterRevision);
@@ -183,6 +205,7 @@ export class SessionProjection {
   snapshot(): SessionProjectionSnapshot {
     return {
       revision: this.revision,
+      readOnly: this.readOnly,
       session: { ...this.session, activeTurnId: this.state.activeTurnId },
       items: this.itemOrder.map((id) => this.itemsById.get(id)!).filter(Boolean),
       turns: [...this.turnsById.values()],
