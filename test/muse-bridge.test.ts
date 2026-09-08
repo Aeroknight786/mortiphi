@@ -447,3 +447,353 @@ describe("MuseBridge session catalog", () => {
     await bridge.close();
   });
 });
+
+describe("MuseBridge idempotent turn resend", () => {
+  interface TurnSend {
+    method: string;
+    params: Record<string, unknown>;
+    options?: { commandId?: string };
+  }
+
+  function idempotentFakeHost(hooks: {
+    mint: () => string;
+    onTurnCommand?: (
+      send: TurnSend,
+      notify: (method: string, params: Record<string, unknown>) => void,
+    ) => Promise<Record<string, unknown>>;
+    onSessionRead?: () => Record<string, unknown>;
+  }) {
+    let emit: (notification: { method: string; params: Record<string, unknown>; emittedAtMs?: number }) => void = () => {};
+    const turnSends: TurnSend[] = [];
+    const readCalls: unknown[] = [];
+    const connection = {
+      onNotification(handler: typeof emit) { emit = handler; },
+      closed: new Promise<void>(() => {}),
+      mintCommandId: hooks.mint,
+      request: async (method: string, params: Record<string, unknown>): Promise<Record<string, unknown>> => {
+        if (method === "session/read") {
+          readCalls.push(params);
+          if (hooks.onSessionRead) return hooks.onSessionRead();
+          return {
+            session: { sessionId: "S", workspaceRoot: "/tmp", createdAt: "", updatedAt: "", turnCount: 0 },
+            history: { mode: "inline", items: [{ itemId: "i1", kind: "userMessage", text: "Hello there" }] },
+          };
+        }
+        if (method === "approval/listPending") return { approvals: [], userInputs: [] };
+        return {};
+      },
+      command: async (method: string, params: Record<string, unknown>, options?: { commandId?: string }): Promise<Record<string, unknown>> => {
+        if (method === "session/resume") return { session: { sessionId: "S" } };
+        if (method === "turn/start" || method === "turn/steer") {
+          const send: TurnSend = { method, params, options };
+          turnSends.push(send);
+          if (hooks.onTurnCommand) {
+            return hooks.onTurnCommand(send, (notifiedMethod, notifiedParams) =>
+              emit({ method: notifiedMethod, params: notifiedParams, emittedAtMs: Date.now() }),
+            );
+          }
+          return { turnId: `t-${turnSends.length}`, disposition: "accepted", commandId: options?.commandId };
+        }
+        return {};
+      },
+    };
+    return {
+      host: {
+        connection,
+        exited: new Promise<never>(() => {}),
+        initializeResult: { schema: { version: 1, fingerprint: "x" } },
+        close: async () => {},
+      },
+      turnSends,
+      readCalls,
+    };
+  }
+
+  function sharedMint() {
+    let minted = 0;
+    return () => `cmd-${(minted += 1)}`;
+  }
+
+  function inFlightSize(bridge: MuseBridge) {
+    return (bridge as unknown as { inFlightCommands: Map<string, Set<string>> }).inFlightCommands.size;
+  }
+
+  it("never resends a turn/start the host admitted before the drop", async () => {
+    const fake = idempotentFakeHost({
+      mint: sharedMint(),
+      onTurnCommand: async (send, notify) => {
+        // Muse admitted the turn, then the ack was lost on a dead transport.
+        notify("turn/started", { sessionId: "S", turnId: "t-admitted", commandId: send.options?.commandId });
+        throw new Error("transport closed unexpectedly");
+      },
+    });
+    const bridge = new MuseBridge({
+      titleStorePath: tmpTitles(),
+      spawnHost: (() => ({ initialize: async () => fake.host })) as any,
+    });
+    await bridge.initialize();
+
+    const error = await bridge.startTurn("S", [{ type: "text", text: "hi" }], "none", "queue").catch((cause) => cause);
+    expect(error).toMatchObject({ code: "turn_unknown_outcome", retryable: false });
+    expect(String(error.message)).toContain("t-admitted");
+    // The admitted turn is surfaced, not re-issued: exactly one send, and the
+    // reconcile hit the in-memory projection without another session/read.
+    expect(fake.turnSends).toHaveLength(1);
+    expect(fake.turnSends[0]?.options?.commandId).toBe("cmd-1");
+    expect(fake.readCalls).toHaveLength(1);
+    expect(inFlightSize(bridge)).toBe(0);
+    await bridge.close();
+  });
+
+  it("reconciles an admitted turn from session state instead of resending", async () => {
+    const mint = sharedMint();
+    let admittedCommandId: string | undefined;
+    const first = idempotentFakeHost({
+      mint,
+      onTurnCommand: async (send) => {
+        admittedCommandId = send.options?.commandId;
+        throw new Error("transport closed unexpectedly");
+      },
+    });
+    const second = idempotentFakeHost({
+      mint,
+      onSessionRead: () => ({
+        session: { sessionId: "S", workspaceRoot: "/tmp", createdAt: "", updatedAt: "", turnCount: 1, activeTurnId: "t-from-read" },
+        history: {
+          mode: "inline",
+          items: [{ itemId: "i9", kind: "userMessage", text: "Hello there", turnId: "t-from-read", commandId: admittedCommandId }],
+        },
+      }),
+    });
+    let spawns = 0;
+    const bridge = new MuseBridge({
+      titleStorePath: tmpTitles(),
+      spawnHost: (() => {
+        spawns += 1;
+        return { initialize: async () => (spawns === 1 ? first.host : second.host) };
+      }) as any,
+    });
+    await bridge.initialize();
+
+    // No turn/started notification arrived, so the projection is clean: the
+    // bridge must consult session state before deciding not to resend.
+    const error = await bridge.startTurn("S", [{ type: "text", text: "hi" }], "none", "queue").catch((cause) => cause);
+    expect(error).toMatchObject({ code: "turn_unknown_outcome", retryable: false });
+    expect(String(error.message)).toContain("t-from-read");
+    expect(first.turnSends).toHaveLength(1);
+    expect(second.turnSends).toHaveLength(0);
+    expect(spawns).toBe(2);
+    expect(inFlightSize(bridge)).toBe(0);
+    await bridge.close();
+  });
+
+  it("surfaces a genuinely unadmitted drop as retryable and retries with a fresh key", async () => {
+    const mint = sharedMint();
+    let sends = 0;
+    const fakes: Array<ReturnType<typeof idempotentFakeHost>> = [];
+    const bridge = new MuseBridge({
+      titleStorePath: tmpTitles(),
+      spawnHost: (() => {
+        const fake = idempotentFakeHost({
+          mint,
+          onTurnCommand: async (send) => {
+            sends += 1;
+            if (sends === 1) throw new Error("transport closed unexpectedly");
+            return { turnId: "t-2", disposition: "accepted", commandId: send.options?.commandId };
+          },
+        });
+        fakes.push(fake);
+        return { initialize: async () => fake.host };
+      }) as any,
+    });
+    await bridge.initialize();
+
+    const error = await bridge.startTurn("S", [{ type: "text", text: "hi" }], "none", "queue").catch((cause) => cause);
+    expect(error).toMatchObject({ code: "muse_operation_failed", retryable: true });
+
+    const result = await bridge.startTurn("S", [{ type: "text", text: "hi" }], "none", "queue");
+    expect(result.turnId).toBe("t-2");
+    const keys = fakes.flatMap((fake) => fake.turnSends.map((send) => send.options?.commandId));
+    expect(keys).toEqual(["cmd-1", "cmd-2"]);
+    expect(inFlightSize(bridge)).toBe(0);
+    await bridge.close();
+  });
+
+  it("mints a distinct commandId per concurrent send", async () => {
+    const fake = idempotentFakeHost({
+      mint: sharedMint(),
+      onTurnCommand: async (send) => {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        const commandId = send.options?.commandId ?? "missing";
+        return { turnId: `t-${commandId}`, disposition: "accepted", commandId };
+      },
+    });
+    const bridge = new MuseBridge({
+      titleStorePath: tmpTitles(),
+      spawnHost: (() => ({ initialize: async () => fake.host })) as any,
+    });
+    await bridge.initialize();
+    await bridge.attach("S");
+
+    const [first, second] = await Promise.all([
+      bridge.startTurn("S", [{ type: "text", text: "a" }], "none", "queue"),
+      bridge.startTurn("S", [{ type: "text", text: "b" }], "none", "queue"),
+    ]);
+    const keys = fake.turnSends.map((send) => send.options?.commandId);
+    expect(keys).toHaveLength(2);
+    expect(new Set(keys).size).toBe(2);
+    expect(first.turnId).not.toBe(second.turnId);
+    expect(inFlightSize(bridge)).toBe(0);
+    await bridge.close();
+  });
+});
+
+describe("MuseBridge reconcile review fixes", () => {
+  function reconcileFake(hooks: {
+    onCommand?: (method: string) => Promise<Record<string, unknown>>;
+    onRead?: () => Record<string, unknown>;
+  }) {
+    const calls: string[] = [];
+    const readSession = hooks.onRead ?? (() => ({ session: { sessionId: "S", workspaceRoot: "/tmp", createdAt: "", updatedAt: "", turnCount: 0 } }));
+    return {
+      host: {
+        connection: {
+          onNotification() {},
+          closed: new Promise<void>(() => {}),
+          mintCommandId: () => `cmd-${calls.length + 1}`,
+          request: async (method: string) => {
+            calls.push(`request:${method}`);
+            if (method === "session/read") return readSession();
+            return { approvals: [], userInputs: [] };
+          },
+          command: async (method: string) => {
+            calls.push(`command:${method}`);
+            if (method === "session/resume") return { session: { sessionId: "S" } };
+            if (hooks.onCommand) return hooks.onCommand(method);
+            return {};
+          },
+        },
+        exited: new Promise<never>(() => {}),
+        initializeResult: { schema: { version: 1, fingerprint: "x" } },
+        close: async () => {},
+      },
+      calls,
+    };
+  }
+
+  function reconcileBridge(fake: ReturnType<typeof reconcileFake>) {
+    return new MuseBridge({
+      titleStorePath: tmpTitles(),
+      spawnHost: (() => ({ initialize: async () => fake.host })) as any,
+    });
+  }
+
+  function rejectedError() {
+    const error = new AppError("muse_operation_failed", "Muse rejected this command.", 409, false, "resync");
+    error.museKind = "commandRejected";
+    error.category = "readable";
+    return error;
+  }
+
+  it("names the absorbed turn for steer with non-retryable wording", async () => {
+    const fake = reconcileFake({
+      onCommand: async (method) => {
+        if (method === "turn/steer") throw new Error("transport closed unexpectedly");
+        return {};
+      },
+    });
+    const bridge = reconcileBridge(fake);
+    await bridge.initialize();
+    const error = await bridge.steer("S", "t-run", [{ type: "text", text: "nudge" }], "none").catch((cause) => cause);
+    expect(error).toMatchObject({ code: "turn_unknown_outcome", retryable: false });
+    expect(String(error.message)).toContain("t-run");
+    expect(String(error.message)).toContain("absorbed");
+    await bridge.close();
+  });
+
+  it("rethrows definitive rejections without a reconcile read", async () => {
+    const fatal = rejectedError();
+    const fake = reconcileFake({
+      onCommand: async (method) => {
+        if (method === "turn/start") throw fatal;
+        return { turnId: "t-x", disposition: "accepted" };
+      },
+    });
+    const bridge = reconcileBridge(fake);
+    await bridge.initialize();
+    const error = await bridge.startTurn("S", [{ type: "text", text: "hi" }], "none", "queue").catch((cause) => cause);
+    expect(error).toBe(fatal);
+    expect(fake.calls.filter((call) => call === "request:session/read")).toHaveLength(1);
+    await bridge.close();
+  });
+
+  it("rethrows muse_unavailable without reconciling a send that never transmitted", async () => {
+    const down = new AppError("muse_unavailable", "Muse is reconnecting.", 503, true, "retry");
+    const fake = reconcileFake({
+      onCommand: async (method) => {
+        if (method === "turn/start") throw down;
+        return { turnId: "t-x", disposition: "accepted" };
+      },
+    });
+    const bridge = reconcileBridge(fake);
+    await bridge.initialize();
+    const error = await bridge.startTurn("S", [{ type: "text", text: "hi" }], "none", "queue").catch((cause) => cause);
+    expect(error).toBe(down);
+    await bridge.close();
+  });
+
+  it("does not claim a pre-existing active turn as the failed send", async () => {
+    const session = { sessionId: "S", workspaceRoot: "/tmp", createdAt: "", updatedAt: "", turnCount: 1, activeTurnId: "t-old" };
+    const fake = reconcileFake({
+      onCommand: async (method) => {
+        if (method === "turn/start") throw new Error("transport closed unexpectedly");
+        return {};
+      },
+      onRead: () => ({ session, history: { mode: "inline", items: [] } }),
+    });
+    const bridge = reconcileBridge(fake);
+    await bridge.initialize();
+    const error = await bridge.startTurn("S", [{ type: "text", text: "hi" }], "none", "queue").catch((cause) => cause);
+    expect(error).toMatchObject({ code: "muse_operation_failed", retryable: true });
+    await bridge.close();
+  });
+
+  it("keeps the original operation in the failure record when the reconcile read fails", async () => {
+    const fake = reconcileFake({
+      onCommand: async (method) => {
+        if (method === "turn/start") throw new Error("transport closed unexpectedly");
+        return {};
+      },
+    });
+    // Fail session/read only after attach's read has succeeded.
+    let reads = 0;
+    const inner = fake.host.connection.request;
+    fake.host.connection.request = async (method: string) => {
+      if (method === "session/read") {
+        reads += 1;
+        if (reads > 1) throw new Error("transport closed unexpectedly");
+      }
+      return (inner as (method: string) => Promise<Record<string, unknown>>)(method);
+    };
+    const bridge = reconcileBridge(fake);
+    await bridge.initialize();
+    const error = await bridge.startTurn("S", [{ type: "text", text: "hi" }], "none", "queue").catch((cause) => cause);
+    expect(error).toMatchObject({ code: "muse_operation_failed" });
+    expect(bridge.health().failures[0]).toMatchObject({ sessionId: "S", method: "turn/start" });
+    await bridge.close();
+  });
+
+  it("retains in-flight pins across host death for reconcile", async () => {
+    // The owning send is still settling through catch/finally when the host
+    // dies; clearing here would blind reconcile's steer lookup. Pins are
+    // self-cleaning (untrack in finally) and cleared at shutdown.
+    const fake = reconcileFake({});
+    const bridge = reconcileBridge(fake);
+    await bridge.initialize();
+    (bridge as unknown as { inFlightCommands: Map<string, Set<string>> }).inFlightCommands.set("S", new Set(["cmd-1"]));
+    (bridge as unknown as { onHostClosed(reason: string): void }).onHostClosed("test");
+    expect(bridge.health().inFlightCommands).toEqual([{ sessionId: "S", commandIds: ["cmd-1"] }]);
+    await bridge.close();
+    expect(bridge.health().inFlightCommands).toEqual([]);
+  });
+});

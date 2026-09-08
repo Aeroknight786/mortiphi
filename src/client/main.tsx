@@ -10,13 +10,14 @@ import { ProjectChangesCard } from "./components/ProjectChangesCard";
 import { extractEditedPaths } from "./diff";
 import { useDismissableLayer } from "./hooks/useDismissableLayer";
 import { handleMarkdownClick, markdown } from "./markdown";
+import { connectionLabel, readTabDraft, scrollAnchorKey, statusLabel, tabDraftId, taskSubtitle } from "./ui-state";
 import "./styles.css";
 
 type Json = Record<string, any>;
 type DetailTab = "overview" | "changes" | "activity";
 type TranscriptBlock = { key: string; turnId: string | null; items: Json[] };
 const EFFORTS: ReasoningEffort[] = ["none", "minimal", "low", "medium", "high", "xhigh", "ultra"];
-const FAILED_TURN_STATES = new Set(["failed", "error", "cancelled", "canceled", "aborted", "timedOut", "timed_out"]);
+const FAILED_TURN_STATES = new Set(["failed", "error", "cancelled", "canceled", "aborted", "timedOut", "timed_out", "stale"]);
 const MODES = [
   { value: "promptUnmatched", label: "Untrusted", detail: "Ask when no rule matches" },
   { value: "onRequest", label: "On request", detail: "Ask when an action requests approval" },
@@ -65,7 +66,7 @@ function App() {
   }, []);
   const refreshHealth = async () => {
     try { setHealth(await api.health()); }
-    catch { setHealth({ connected: false, reconnectAttempt: 0, reconnectScheduled: true, subscriptions: 0, pendingReattach: [] }); }
+    catch { setHealth({ connected: false, reconnectAttempt: 0, reconnectScheduled: true, subscriptions: 0, inFlightCommands: [], pendingReattach: [] }); }
   };
   useEffect(() => {
     if (!boot) return;
@@ -205,7 +206,7 @@ function App() {
         <TaskHeader session={current} snapshot={snapshot} detailOpen={detailOpen} setDetailOpen={setDetailOpen} onCommand={command} />
         {snapshot.readOnly && <div class="warning-note" role="status">Muse can't resume this task, so it's read-only. <button class="quiet-button" onClick={() => void command("resync")}>Resync</button> <button class="quiet-button" onClick={() => void command("fork")}>Fork to continue</button></div>}
         <div class={`work-grid ${compactLayout ? "compact-layout" : ""}`} style={{ gridTemplateColumns: detailOpen && !compactLayout ? `minmax(0, 1fr) ${detailWidth}px` : "1fr" }}>
-          <section class="conversation"><Transcript snapshot={snapshot} sessionId={activeId} onRefresh={() => void refreshSnapshot()} setError={setError} /><Composer sessionId={activeId} snapshot={snapshot} readOnly={snapshot.readOnly} onCommand={command} onSnapshot={() => void refreshSnapshot()} setError={setError} /></section>
+          <section class="conversation"><Transcript snapshot={snapshot} sessionId={activeId} onRefresh={() => void refreshSnapshot()} setError={setError} /><Composer key={activeId} sessionId={activeId} snapshot={snapshot} readOnly={snapshot.readOnly} onCommand={command} onSnapshot={() => void refreshSnapshot()} setError={setError} /></section>
           {detailOpen && <Details sessionId={activeId} snapshot={snapshot} tab={detailTab} setTab={setDetailTab} setError={setError} onResize={(width) => { setDetailWidth(width); localStorage.setItem("mortiphi:detail-width", String(width)); }} />}
         </div>
       </> : <Welcome onNew={() => setDialog("new")} sessions={sessions} onChoose={chooseTask} />}
@@ -256,10 +257,47 @@ function TaskHeader({ session, snapshot, detailOpen, setDetailOpen, onCommand }:
 
 function Transcript({ snapshot, sessionId, onRefresh, setError }: { snapshot: SessionProjectionSnapshot; sessionId: string; onRefresh: () => void; setError: (e: ApiError) => void }) {
   const end = useRef<HTMLDivElement>(null);
+  const scroller = useRef<HTMLDivElement>(null);
+  const atBottomRef = useRef(true);
+  const restoredRef = useRef<string | null>(null);
+  const saveTimer = useRef<number>();
   const failedTurns = authoritativeFailedTurns(snapshot);
   const blocks = transcriptBlocks(snapshot.items);
-  useEffect(() => end.current?.scrollIntoView({ block: "end" }), [snapshot.items.length, snapshot.items.at(-1)?.text, snapshot.pending.approvals.length]);
-  return <div class="transcript" onClick={(e) => handleMarkdownClick(e as unknown as MouseEvent)}>{snapshot.items.length === 0 && <div class="empty-transcript"><span>φ</span><h2>What are we building?</h2><p>Describe the outcome. Add files with @ or images with the attachment button.</p></div>}
+  useEffect(() => {
+    const el = scroller.current;
+    if (!el) return;
+    const persist = () => {
+      const nearBottom = isNearBottom(el);
+      atBottomRef.current = nearBottom;
+      if (nearBottom) { localStorage.removeItem(scrollAnchorKey(sessionId)); return; }
+      const anchor = firstVisibleItemId(el);
+      if (anchor) localStorage.setItem(scrollAnchorKey(sessionId), anchor);
+    };
+    // atBottomRef tracks synchronously so a streaming chunk landing between
+    // scroll and the debounced write can't act on a stale true; only the
+    // storage write is debounced.
+    const onScroll = () => { atBottomRef.current = isNearBottom(el); window.clearTimeout(saveTimer.current); saveTimer.current = window.setTimeout(persist, 150); };
+    atBottomRef.current = isNearBottom(el);
+    el.addEventListener("scroll", onScroll, { passive: true });
+    return () => { el.removeEventListener("scroll", onScroll); window.clearTimeout(saveTimer.current); persist(); };
+  }, [sessionId]);
+  useEffect(() => {
+    if (restoredRef.current === sessionId || snapshot.items.length === 0) return;
+    restoredRef.current = sessionId;
+    const anchor = localStorage.getItem(scrollAnchorKey(sessionId));
+    const target = anchor ? findAnchorItem(scroller.current, anchor) : null;
+    if (target) { atBottomRef.current = false; target.scrollIntoView({ block: "start" }); return; }
+    // Anchor missing (compacted away or never rendered): drop it so it can't
+    // shadow a future position, then bottom — the only place left to go.
+    if (anchor) localStorage.removeItem(scrollAnchorKey(sessionId));
+    atBottomRef.current = true;
+    end.current?.scrollIntoView({ block: "end" });
+  }, [sessionId, snapshot.items.length]);
+  useEffect(() => {
+    if (restoredRef.current !== sessionId || !atBottomRef.current) return;
+    end.current?.scrollIntoView({ block: "end" });
+  }, [sessionId, snapshot.items.length, snapshot.items.at(-1)?.text, snapshot.pending.approvals.length]);
+  return <div ref={scroller} class="transcript" onClick={(e) => handleMarkdownClick(e as unknown as MouseEvent)}>{snapshot.items.length === 0 && <div class="empty-transcript"><span>φ</span><h2>What are we building?</h2><p>Describe the outcome. Add files with @ or images with the attachment button.</p></div>}
     {blocks.map((block) => <TranscriptBlockView key={block.key} block={block} sessionId={sessionId} activeTurnId={snapshot.state.activeTurnId} queuedTurnIds={snapshot.state.queuedTurns.map((turn) => String(turn.turnId))} setError={setError}/>)}
     {failedTurns.map((turn) => <TurnNotice key={String(turn.turnId)} title="Could not complete this prompt" detail={String(turn.reason ?? turn.message ?? `Turn ended as ${turn.state}.`)} />)}
     {snapshot.pending.approvals.map((approval) => <ApprovalCard key={String(approval.approvalId)} approval={approval} sessionId={sessionId} onRefresh={onRefresh} setError={setError} />)}
@@ -292,9 +330,9 @@ function SafeItemView({ item }: { item: Json }) {
 }
 
 function ItemView({ item }: { item: Json }) {
-  if (item.kind === "userMessage") return <article class={`message user ${item.retracted ? "retracted" : ""}`}><div class="message-label">You {item.steered && <span>· steering</span>}{item.retracted && <span>· retracted</span>}</div><div class="message-body" dangerouslySetInnerHTML={markdown(String(item.text ?? ""))}/>{Array.isArray(item.attachments) && item.attachments.length > 0 && <small>{item.attachments.length} image attachment{item.attachments.length > 1 ? "s" : ""}</small>}</article>;
-  if (item.kind === "agentMessage") return <article class="message agent"><div class="message-body" dangerouslySetInnerHTML={markdown(String(item.text ?? ""))}/>{item.truncated && <div class="warning-note">Earlier output is shortened in this view. The full output remains in the session.</div>}</article>;
-  return <details class="activity-item unknown"><summary><span>?</span> {item.kind ?? "Unknown item"} <small>{item.status ?? "unknown"}</small></summary><p>{item.fallbackText ?? item.text ?? "This item kind is newer than mortiφ. It remains preserved in the session."}</p></details>;
+  if (item.kind === "userMessage") return <article class={`message user ${item.retracted ? "retracted" : ""}`} data-item-id={item.itemId ?? undefined}><div class="message-label">You {item.steered && <span>· steering</span>}{item.retracted && <span>· retracted</span>}</div><div class="message-body" dangerouslySetInnerHTML={markdown(String(item.text ?? ""))}/>{Array.isArray(item.attachments) && item.attachments.length > 0 && <small>{item.attachments.length} image attachment{item.attachments.length > 1 ? "s" : ""}</small>}</article>;
+  if (item.kind === "agentMessage") return <article class="message agent" data-item-id={item.itemId ?? undefined}><div class="message-body" dangerouslySetInnerHTML={markdown(String(item.text ?? ""))}/>{item.truncated && <div class="warning-note">Earlier output is shortened in this view. The full output remains in the session.</div>}</article>;
+  return <details class="activity-item unknown" data-item-id={item.itemId ?? undefined}><summary><span>?</span> {item.kind ?? "Unknown item"} <small>{item.status ?? "unknown"}</small></summary><p>{item.fallbackText ?? item.text ?? "This item kind is newer than mortiφ. It remains preserved in the session."}</p></details>;
 }
 
 function TurnNotice({ title, detail, prompt }: { title: string; detail: string; prompt?: string }) {
@@ -314,8 +352,10 @@ function LiveTurnStatus({ snapshot }: { snapshot: SessionProjectionSnapshot }) {
 }
 
 function Composer({ sessionId, snapshot, readOnly, onCommand, onSnapshot, setError }: { sessionId: string; snapshot: SessionProjectionSnapshot; readOnly?: boolean; onCommand: (id: string, args?: string) => void; onSnapshot: () => void; setError: (e: ApiError) => void }) {
-  const draftKey = `mortiphi:draft:${sessionId}`;
-  const [text, setText] = useState(() => localStorage.getItem(draftKey) ?? "");
+  const [tabId] = useState(tabDraftId);
+  const legacyDraftKey = `mortiphi:draft:${sessionId}`;
+  const draftKey = `${legacyDraftKey}:${tabId}`;
+  const [text, setText] = useState(() => readTabDraft(draftKey, legacyDraftKey));
   const [effort, setEffort] = useState<ReasoningEffort>(() => (localStorage.getItem("mortiphi:effort") as ReasoningEffort) || "high");
   const [mode, setMode] = useState<"queue" | "steer" | "replace">("queue");
   const [images, setImages] = useState<TurnInputPart[]>([]);
@@ -463,19 +503,7 @@ function groupProjects(sessions: SessionSummary[]): ProjectSummary[] { const map
 function normalize(error: unknown) { return error instanceof ApiError ? error : new ApiError("unexpected_error", error instanceof Error ? error.message : String(error), true, "Retry. If it persists, restart mortiφ."); }
 function folderName(path: string) { return path.split(/[\\/]/).filter(Boolean).at(-1) ?? "Project"; }
 function titleFrom(items: Json[]) { const item=items.find((i)=>i.kind==="userMessage"&&!i.retracted); return item?.text ? String(item.text).replace(/\s+/g," ").slice(0,68) : "New task"; }
-function statusLabel(status: string) { return ({running:"Running",queued:"Queued",waiting:"Waiting",failed:"Failed",idle:"Idle"} as Json)[status] ?? status; }
-function connectionLabel(health: HealthStatus | null, bootConnected: boolean) {
-  if (!health) return bootConnected ? "Connected" : "Unavailable";
-  if (health.connected) return "Connected";
-  return health.reconnectScheduled || health.reconnectAttempt > 0 ? "Reconnecting" : "Unavailable";
-}
-function taskSubtitle(session: SessionSummary) {
-  if (session.unopenableReason) return "Needs attention · unopenable";
-  const base = session.available ? session.status === "idle" ? relativeTime(session.updatedAt) : `${statusLabel(session.status)} · ${relativeTime(session.updatedAt)}` : "Workspace unavailable";
-  return session.readOnly ? `${base} · Read-only` : base;
-}
 function gitStatusLabel(status: string) { const value=status.trim();if(status==="??")return "New";if(value.includes("R"))return "Renamed";if(value.includes("D"))return "Deleted";if(value.includes("A"))return "Added";if(value.includes("M"))return "Modified";if(value.includes("C"))return "Copied";return value||"Changed"; }
-function relativeTime(value: string) { const ms=Date.now()-new Date(value).getTime();if(!Number.isFinite(ms))return "time unavailable";const min=Math.floor(ms/60000);if(min<1)return "now";if(min<60)return `${min}m ago`;const hrs=Math.floor(min/60);if(hrs<24)return `${hrs}h ago`;return `${Math.floor(hrs/24)}d ago`; }
 function formatDate(value: string) { const date=new Date(value); return Number.isFinite(date.getTime())?date.toLocaleString():"Unavailable"; }
 function formatNumber(value: unknown) { const number=Number(value??0); return Number.isFinite(number)?new Intl.NumberFormat("en",{notation:number>9999?"compact":"standard"}).format(number):"—"; }
 function totalTokens(value: Json) { return Object.values(value).filter((v)=>typeof v==="number").reduce<number>((a,b)=>a+(b as number),0); }
@@ -485,6 +513,19 @@ function modeLabel(value: string) { return MODES.find((m)=>m.value===value)?.lab
 function effectiveMode(snapshot: SessionProjectionSnapshot | null) { return String(snapshot?.state.approvalMode?.mode ?? (snapshot?.session.approvalMode as Json)?.mode ?? "promptUnmatched"); }
 function authoritativeFailedTurns(snapshot: SessionProjectionSnapshot) { return snapshot.turns.filter((turn)=>FAILED_TURN_STATES.has(String(turn.state))); }
 function sessionState(snapshot: SessionProjectionSnapshot) { if(snapshot.state.connection!=="connected")return "failed";if(snapshot.state.activeTurnId)return "running";if(snapshot.pending.approvals.length||snapshot.pending.userInputs.length)return "waiting";if(snapshot.state.queuedTurns.length)return "queued";if(authoritativeFailedTurns(snapshot).length)return "failed";return "idle"; }
+function isNearBottom(el: HTMLElement, tolerance = 48) { return el.scrollHeight - el.scrollTop - el.clientHeight <= tolerance; }
+function firstVisibleItemId(container: HTMLElement) {
+  const top = container.getBoundingClientRect().top;
+  const nodes = container.querySelectorAll("[data-item-id]");
+  for (const node of nodes) if (node.getBoundingClientRect().bottom > top) return node.getAttribute("data-item-id");
+  return null;
+}
+function findAnchorItem(container: HTMLElement | null, anchor: string) {
+  if (!container) return null;
+  const nodes = container.querySelectorAll("[data-item-id]");
+  for (const node of nodes) if (node.getAttribute("data-item-id") === anchor) return node;
+  return null;
+}
 function transcriptBlocks(items: Json[]): TranscriptBlock[] { const raw: TranscriptBlock[]=[];for(const [index,item] of items.entries()){const turnId=typeof item.turnId==="string"?item.turnId:null;const previous=raw.at(-1);if(previous&&previous.turnId===turnId)previous.items.push(item);else raw.push({key:`${turnId??"session"}:${index}`,turnId,items:[item]});}const blocks: TranscriptBlock[]=[];for(const block of raw){const previous=blocks.at(-1);const previousPrompt=previous?.items.find((item)=>item.kind==="userMessage");const nextPrompt=block.items.find((item)=>item.kind==="userMessage");const previousAnswered=previous?.items.some((item)=>item.kind==="agentMessage");if(previous&&previousPrompt&&nextPrompt&&!previousAnswered&&normalizedPrompt(previousPrompt.text)===normalizedPrompt(nextPrompt.text)){previous.items.push(...block.items);previous.turnId=block.turnId;continue;}blocks.push(block);}return blocks; }
 function normalizedPrompt(value: unknown) { return String(value??"").trim().replace(/\s+/g," "); }
 function activityName(item: Json) { if(item.kind==="reasoning")return "Reasoning";if(item.kind==="compaction")return "Context compacted";if(item.kind==="toolCall"||item.kind==="userShell")return String(item.tool??(item.kind==="userShell"?"Shell":"Tool"));if(item.kind==="subagent")return "Subagent";if(item.kind==="workflow")return "Workflow";return String(item.kind??"Activity"); }

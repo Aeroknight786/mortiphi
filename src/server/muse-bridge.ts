@@ -1,8 +1,9 @@
 import { execFile } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
-import { EXPECTED_SCHEMA_FINGERPRINT, spawnMspConnection, type SpawnedMspConnection } from "@muse-code/sdk";
+import { EXPECTED_SCHEMA_FINGERPRINT, spawnMspConnection, type CommandOptions, type SpawnedMspConnection } from "@muse-code/sdk";
 import type { Diagnostics, ReasoningEffort, SessionListResponse, SessionSummary, TurnInputPart } from "../shared/contracts.js";
 import { MORTIPHI_VERSION } from "../shared/version.js";
 import { AppError, classifyMuseError, friendlyMuseMessage, messageFrom } from "./errors.js";
@@ -48,6 +49,8 @@ export class MuseBridge {
   private subscribed = new Set<string>();
   private releaseTimers = new Map<string, NodeJS.Timeout>();
   private failures = new Map<string, SessionFailure>();
+  private inFlightCommands = new Map<string, Set<string>>();
+  private steerCommands = new Map<string, string>();
   private quarantined = new Map<string, string>();
   private readOnlyIds = new Set<string>();
   private pendingReattach = new Set<string>();
@@ -128,6 +131,10 @@ export class MuseBridge {
     }
     this.host = undefined;
     for (const projection of this.projections.values()) projection.disconnect();
+    // In-flight pins are NOT cleared here: their owning sends are still
+    // settling through catch/finally, and reconcile needs the steer pin to
+    // name the targeted turn. Both maps are self-cleaning (untrack in
+    // finally); close() clears them at shutdown.
     // The dead host's views are gone. Move the claims to the re-attach queue:
     // leaving them in `subscribed` would make attach() early-return against a
     // host that never ran session/resume, leaving the session permanently blind.
@@ -203,6 +210,7 @@ export class MuseBridge {
       reconnectScheduled: Boolean(this.reconnectTimer),
       lastExit: this.lastExit ?? null,
       subscriptions: this.subscribed.size,
+      inFlightCommands: [...this.inFlightCommands.entries()].map(([sessionId, commandIds]) => ({ sessionId, commandIds: [...commandIds] })),
       pendingReattach: [...this.pendingReattach],
       projections: this.projections.size,
       pendingReleases: this.releaseTimers.size,
@@ -433,16 +441,40 @@ export class MuseBridge {
   async startTurn(sessionId: string, input: TurnInputPart[], effort: ReasoningEffort, ifBusy: string) {
     return this.withSessionLoaded(sessionId, async (projection) => {
       this.assertWritable(projection, sessionId);
-      const result = await this.command("turn/start", { sessionId, input, displayText: displayText(input), reasoningEffort: effort, ifBusy });
-      projection.admitTurn(result);
-      return result;
+      // Pin one client-minted commandId per send so a drop mid-send can be
+      // reconciled against the admitted turn instead of re-issued as a dup.
+      const commandId = this.mintCommandId();
+      this.trackInFlight(sessionId, commandId);
+      const priorActive = typeof projection.snapshot === "function" ? projection.snapshot().state.activeTurnId : null;
+      try {
+        const result = await this.command("turn/start", { sessionId, input, displayText: displayText(input), reasoningEffort: effort, ifBusy }, { commandId });
+        projection.admitTurn(result);
+        return result;
+      } catch (error) {
+        return this.reconcileTurnSend(sessionId, projection, "turn/start", commandId, error, "admitted", priorActive);
+      } finally {
+        this.untrackInFlight(sessionId, commandId);
+      }
     });
   }
 
   async steer(sessionId: string, expectedTurnId: string, input: TurnInputPart[], effort?: ReasoningEffort) {
     return this.withSessionLoaded(sessionId, async (projection) => {
       this.assertWritable(projection, sessionId);
-      return this.command("turn/steer", compact({ sessionId, expectedTurnId, input, reasoningEffort: effort }));
+      const commandId = this.mintCommandId();
+      this.trackInFlight(sessionId, commandId);
+      // A steer carries no new turnId (its input is absorbed into the running
+      // turn), so remember which turn this commandId targeted for reconcile.
+      // Read in catch below; deleted in finally after reconcile has run.
+      this.steerCommands.set(commandId, expectedTurnId);
+      try {
+        return await this.command("turn/steer", compact({ sessionId, expectedTurnId, input, reasoningEffort: effort }), { commandId });
+      } catch (error) {
+        return this.reconcileTurnSend(sessionId, projection, "turn/steer", commandId, error, "absorbed", expectedTurnId);
+      } finally {
+        this.steerCommands.delete(commandId);
+        this.untrackInFlight(sessionId, commandId);
+      }
     });
   }
   async interrupt(sessionId: string, turnId?: string) {
@@ -519,6 +551,8 @@ export class MuseBridge {
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     this.reconnectTimer = undefined;
     this.pendingReattach.clear();
+    this.inFlightCommands.clear();
+    this.steerCommands.clear();
     for (const timer of this.releaseTimers.values()) clearTimeout(timer);
     this.releaseTimers.clear();
     this.subscribed.clear();
@@ -598,28 +632,112 @@ export class MuseBridge {
     };
   }
 
-  private async request(method: string, params: Json): Promise<Json> {
+  private async request(method: string, params: Json, silent = false): Promise<Json> {
     await this.ensureHost();
     try {
       return await this.connection.request(method, params);
     } catch (error) {
-      throw this.noteFailure(method, params, error);
+      throw this.noteFailure(method, params, error, silent);
     }
   }
-  private async command(method: string, params: Json): Promise<Json> {
+  private async command(method: string, params: Json, options?: CommandOptions): Promise<Json> {
     await this.ensureHost();
     try {
-      return await this.connection.command(method, params);
+      return await this.connection.command(method, params, options);
     } catch (error) {
       throw this.noteFailure(method, params, error);
     }
   }
 
-  private noteFailure(method: string, params: Json, error: unknown): AppError {
+  private mintCommandId(): string {
+    try {
+      return this.connection.mintCommandId();
+    } catch {
+      // No live host (unit stubs that replace command()/attach()). The real
+      // send path always runs after ensureHost, so production ids still come
+      // from the connection's single minter.
+      return randomUUID();
+    }
+  }
+
+  private trackInFlight(sessionId: string, commandId: string) {
+    const pending = this.inFlightCommands.get(sessionId) ?? new Set<string>();
+    pending.add(commandId);
+    this.inFlightCommands.set(sessionId, pending);
+  }
+
+  private untrackInFlight(sessionId: string, commandId: string) {
+    const pending = this.inFlightCommands.get(sessionId);
+    if (!pending) return;
+    pending.delete(commandId);
+    if (!pending.size) this.inFlightCommands.delete(sessionId);
+  }
+
+  private async reconcileTurnSend(sessionId: string, projection: SessionProjection, method: string, commandId: string, error: unknown, outcome: "admitted" | "absorbed", priorActive: string | null): Promise<never> {
+    if (!isUnknownOutcome(error)) throw error;
+    // Reconcile before any resend: if Muse already took this commandId,
+    // surfacing that beats re-issuing it as a duplicate.
+    const admittedInMemory = this.findAdmittedTurnId(projection, commandId) ?? this.steerCommands.get(commandId);
+    if (admittedInMemory) throw this.unknownTurnOutcome(sessionId, method, commandId, admittedInMemory, error, outcome);
+    // Always attempt the metadata leg: sampling connectedness before the send
+    // misses the reconnect race (down at capture, transmitted before the ack
+    // was lost). Metadata-only — a full history read on every failure would
+    // reintroduce the catalog-cost disease this bridge just cured. Only new
+    // activity counts: a pre-existing active turn is not evidence our send
+    // landed (fresh turns carry turnId == commandId, so ours is unmistakable).
+    try {
+      const read = await this.request("session/read", { sessionId, excludeItems: true }, true);
+      const active = text(asJson(read.session).activeTurnId);
+      if (active && (active === commandId || active !== priorActive)) {
+        throw this.unknownTurnOutcome(sessionId, method, commandId, active, error, outcome);
+      }
+    } catch (readError) {
+      if (readError instanceof AppError && readError.code === "turn_unknown_outcome") throw readError;
+      // Best-effort: a failed reconcile must not mask the original failure.
+    }
+    throw error;
+  }
+
+  private findAdmittedTurnId(projection: SessionProjection, commandId: string): string | undefined {
+    const snapshot = typeof projection.snapshot === "function" ? projection.snapshot() : undefined;
+    const turns = snapshot?.turns ?? [];
+    for (const turn of turns) {
+      // Fresh turns carry turnId == commandId (SS3.1.4), so match the turn id
+      // too: it catches admitted turns whose command echo never arrived.
+      if ((turn.commandId === commandId || turn.turnId === commandId) && typeof turn.turnId === "string") return turn.turnId;
+    }
+    for (const queued of snapshot?.state.queuedTurns ?? []) {
+      if ((queued.commandId === commandId || queued.turnId === commandId) && typeof queued.turnId === "string") return queued.turnId;
+    }
+    return undefined;
+  }
+
+  private unknownTurnOutcome(sessionId: string, method: string, commandId: string, turnId: string, cause: unknown, outcome: "admitted" | "absorbed"): AppError {
+    // retryable is deliberately false: no generic retry loop may resend this.
+    // A retry with a fresh key would manufacture the duplicate turn this
+    // error exists to prevent; resyncing observes the original instead.
+    const failure = new AppError(
+      "turn_unknown_outcome",
+      outcome === "admitted"
+        ? `Muse admitted turn ${turnId} but the confirmation was lost in a connection drop.`
+        : `Muse may have absorbed steer ${commandId} into turn ${turnId} before the connection dropped.`,
+      409,
+      false,
+      "Resync the task to observe it. Do not resend — a resend would create a duplicate turn.",
+    );
+    this.recordFailure(sessionId, method, failure, `${messageFrom(cause)} (command ${commandId}, turn ${turnId})`);
+    logBridge("turn_unknown_outcome", { method, sessionId, commandId, turnId });
+    return failure;
+  }
+
+  private noteFailure(method: string, params: Json, error: unknown, silent = false): AppError {
     const raw = messageFrom(error);
-    if (error instanceof AppError && error.code !== "muse_operation_failed") {
+    // Already classified (a previous transportError, or a hand-built AppError
+    // carrying kind/category): re-wrapping would discard the kind, category,
+    // and friendly message, so record and pass through untouched.
+    if (error instanceof AppError && (error.code !== "muse_operation_failed" || error.category !== undefined)) {
       const sessionId = typeof params.sessionId === "string" ? params.sessionId : undefined;
-      this.recordFailure(sessionId, method, error, raw);
+      if (!silent) this.recordFailure(sessionId, method, error, raw);
       return error;
     }
     const failure = transportError(error, method);
@@ -630,7 +748,9 @@ export class MuseBridge {
     if (/closed|transport|EPIPE|ECONNRESET|not connected/i.test(raw) && this.host) {
       this.onHostClosed(`transport:${method}`);
     }
-    this.recordFailure(sessionId, method, failure, raw);
+    // Silent reads are best-effort probes (reconcile): recording them would
+    // overwrite the real operation's entry in the per-session failure map.
+    if (!silent) this.recordFailure(sessionId, method, failure, raw);
     return failure;
   }
 
@@ -652,6 +772,19 @@ function transportError(error: unknown, method: string) {
 
 function logBridge(event: string, fields: Record<string, unknown> = {}) {
   console.error(JSON.stringify({ ts: new Date().toISOString(), component: "muse-bridge", event, ...fields }));
+}
+function isUnknownOutcome(error: unknown) {
+  // Retryable means the operation's outcome is uncertain by construction: the
+  // ack never arrived (transport) or the server explicitly allows retry
+  // (overloaded, sessionNotLoaded, internal). Definitive rejections
+  // (commandRejected and friends) and sends that never transmitted
+  // (muse_unavailable) are not worth reconciling. Reconcile-first is safe
+  // even for pre-intake rejections: a read that finds nothing rethrows the
+  // original error untouched.
+  if (!(error instanceof AppError)) return true;
+  if (error.code === "muse_unavailable") return false;
+  if (error.code !== "muse_operation_failed") return false;
+  return error.retryable === true;
 }
 function isSessionNotLoaded(error: unknown) {
   if (error instanceof AppError && (error.museKind === "sessionNotLoaded" || error.museCode === -32024)) return true;

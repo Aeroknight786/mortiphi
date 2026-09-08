@@ -36,6 +36,7 @@ export interface HealthStatus {
   reconnectAttempt: number;
   reconnectScheduled: boolean;
   subscriptions: number;
+  inFlightCommands: Array<{ sessionId: string; commandIds: string[] }>;
   pendingReattach: string[];
 }
 
