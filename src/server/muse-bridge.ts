@@ -365,7 +365,6 @@ export class MuseBridge {
     this.buffered.set(sessionId, buffer);
     let resumedSuccessfully = false;
     try {
-      await this.ensureHost();
       const host = this.host;
       const resumed = await this.command("session/resume", { sessionId, excludeItems: false });
       resumedSuccessfully = true;
