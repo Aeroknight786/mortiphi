@@ -55,7 +55,7 @@ export interface SessionSummary {
   workspaceRoot: string;
   title: string;
   titleSource?: "prompt" | "mortiphi";
-  status: "running" | "queued" | "waiting" | "failed" | "idle";
+  status: "running" | "queued" | "waiting" | "failed" | "idle" | "reconnecting";
   activeTurnId?: string | null;
   modelId?: string | null;
   providerId?: string | null;

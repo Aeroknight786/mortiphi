@@ -28,7 +28,7 @@ export function connectionLabel(health: HealthStatus | null, bootConnected: bool
 export function scrollAnchorKey(sessionId: string) { return `mortiphi:scroll:${sessionId}`; }
 
 export function statusLabel(status: string) {
-  return ({ running: "Running", queued: "Queued", waiting: "Waiting", failed: "Failed", idle: "Idle" } as Record<string, string>)[status] ?? status;
+  return ({ running: "Running", queued: "Queued", waiting: "Waiting", failed: "Failed", idle: "Idle", reconnecting: "Reconnecting" } as Record<string, string>)[status] ?? status;
 }
 
 export function relativeTime(value: string) {

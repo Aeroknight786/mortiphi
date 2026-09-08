@@ -96,7 +96,7 @@ function App() {
   useEffect(() => { setError(null); }, [activeId]);
   const refreshSnapshot = async (id = activeIdRef.current) => {
     if (!id) return;
-    try { const next = await api.snapshot(id); if (activeIdRef.current === id) setSnapshot(next); }
+    try { const next = await api.snapshot(id); if (activeIdRef.current === id) setSnapshot((prev) => !prev || next.revision >= prev.revision ? next : prev); }
     catch (e) { if (activeIdRef.current === id) setError(normalize(e)); }
   };
   useEffect(() => {
@@ -105,11 +105,13 @@ function App() {
     const after = snapshotRef.current?.revision ?? 0;
     const source = new EventSource(`/api/sessions/${id}/events?afterRevision=${after}`);
     const schedule = () => {
-      window.clearTimeout(refreshTimer.current);
-      refreshTimer.current = window.setTimeout(() => void refreshSnapshot(id), 45);
+      if (refreshTimer.current !== undefined) return;
+      refreshTimer.current = window.setTimeout(() => { refreshTimer.current = undefined; void refreshSnapshot(id); }, 45);
     };
     source.addEventListener("projection", (event) => {
       const parsed = JSON.parse((event as MessageEvent).data);
+      if (activeIdRef.current !== id) return;
+      if (parsed.method === "morti/hostDisconnected") setSnapshot((prev) => prev ? { ...prev, state: { ...prev.state, connection: "disconnected" } } : prev);
       if (["turn/completed", "turn/retracted", "approval/requested", "userInput/requested"].includes(parsed.method)) setAnnouncement(eventAnnouncement(parsed));
       applyIncrementalEvent(parsed, setSnapshot);
       schedule();
@@ -121,7 +123,7 @@ function App() {
       })();
     });
     source.onerror = () => { setAnnouncement("Muse connection interrupted. Reconnecting."); void refreshHealth(); };
-    return () => { source.close(); window.clearTimeout(refreshTimer.current); };
+    return () => { source.close(); window.clearTimeout(refreshTimer.current); refreshTimer.current = undefined; };
   }, [activeId]);
 
   const projects = useMemo(() => groupProjects(sessions), [sessions]);
@@ -251,7 +253,7 @@ function TaskHeader({ session, snapshot, detailOpen, setDetailOpen, onCommand }:
   const menuRef = useDismissableLayer<HTMLDivElement>(menu, () => setMenu(false));
   const state = sessionState(snapshot);
   const stage = transientStage(snapshot, state);
-  const actions = [["fork","Fork task"],["rename","Rename task"],["clear","New task in this project"],["compact","Compact context"],["copy","Copy last response"],["delete","Remove task"]];
+  const actions = [["fork","Fork task"],["rename","Rename task"],["clear","New task in this project"],["resync","Refresh task"],["compact","Compact context"],["copy","Copy last response"],["delete","Remove task"]];
   return <header class="task-header"><div><span class="eyebrow">{folderName(String(snapshot.session.workspaceRoot ?? ""))}</span><h1>{session?.title ?? titleFrom(snapshot.items)}</h1></div><div class="header-actions">{state !== "idle" && <span class={`state-pill ${state}`}><span>{statusLabel(state)}</span>{stage && <small>· {stage}</small>}</span>}<button class={`details-button ${detailOpen ? "selected" : ""}`} onClick={() => setDetailOpen(!detailOpen)} aria-label="Toggle details">Details</button><div ref={menuRef} class="menu-wrap"><button class="icon-button" onClick={() => setMenu(!menu)} aria-haspopup="menu" aria-expanded={menu}>•••</button>{menu && <div class="popover menu" role="menu">{actions.map(([id,label]) => <button class={id === "delete" ? "danger-action" : ""} role="menuitem" onClick={() => { setMenu(false); void onCommand(id!); }}>{label}</button>)}</div>}</div></div></header>;
 }
 
@@ -346,8 +348,9 @@ function LiveTurnStatus({ snapshot }: { snapshot: SessionProjectionSnapshot }) {
   const latest = latestLiveItem(snapshot);
   const updated = new Date(String(snapshot.session.updatedAt ?? "")).getTime();
   const quietSeconds = Number.isFinite(updated) ? Math.max(0, Math.floor((now - updated) / 1000)) : 0;
-  const label = snapshot.pending.approvals.length ? "Waiting for your permission" : snapshot.pending.userInputs.length ? "Waiting for your answer" : liveActivityLabel(latest);
-  const detail = quietSeconds >= 10 ? `Still working · ${quietSeconds}s since the last update` : latest ? null : "Starting…";
+  const connected = snapshot.state.connection === "connected";
+  const label = !connected ? "Reconnecting" : snapshot.pending.approvals.length ? "Waiting for your permission" : snapshot.pending.userInputs.length ? "Waiting for your answer" : liveActivityLabel(latest);
+  const detail = !connected ? "Waiting for the connection to return." : quietSeconds >= 10 ? `Still working · ${quietSeconds}s since the last update` : latest ? null : "Starting…";
   return <div class={`live-turn ${quietSeconds >= 10 ? "quiet" : ""}`} aria-label="Task in progress"><span class="live-pulse" aria-hidden="true"/><div><strong>{label}</strong>{detail && <small>{detail}</small>}</div></div>;
 }
 

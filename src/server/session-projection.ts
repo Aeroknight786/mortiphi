@@ -1,11 +1,5 @@
 import type { ProjectionEvent, SessionProjectionSnapshot } from "../shared/contracts.js";
 
-// Silence window before a still-"running" turn is treated as orphaned.
-// Streaming turns emit item/delta every few seconds and host reconnects take
-// seconds, so 120s of zero events for the active turn means no live host will
-// ever terminal it. Tunable per call via markStaleTurns(nowMs, maxSilenceMs).
-export const STALE_TURN_SILENCE_MS = 120_000;
-
 const KNOWN = new Set([
   "turn/started", "turn/completed", "turn/retracted", "turn/retryScheduled", "turn/unqueued",
   "item/started", "item/updated", "item/delta", "item/completed", "view/gap",
@@ -25,7 +19,7 @@ export class SessionProjection {
   private approvals = new Map<string, Record<string, unknown>>();
   private userInputs = new Map<string, Record<string, unknown>>();
   private journal: ProjectionEvent[] = [];
-  private turnLastEventAtMs = new Map<string, number>();
+  private seenCursors = new Set<string>();
   private listeners = new Set<(event: ProjectionEvent | { type: "resyncRequired" }) => void>();
   private maxJournal: number;
   needsResync = false;
@@ -59,7 +53,7 @@ export class SessionProjection {
     this.turnsById.clear();
     this.approvals.clear();
     this.userInputs.clear();
-    this.turnLastEventAtMs.clear();
+    this.seenCursors.clear();
     this.needsResync = false;
     this.state = {
       activeTurnId: typeof session.activeTurnId === "string" ? session.activeTurnId : null,
@@ -106,6 +100,9 @@ export class SessionProjection {
   }
 
   apply(method: string, params: Record<string, unknown>, emittedAtMs?: number, replay = false) {
+    const cursor = string(params.viewCursor);
+    if (cursor && this.seenCursors.has(cursor)) return;
+    if (cursor) this.seenCursors.add(cursor);
     if (!replay && emittedAtMs) this.session.updatedAt = new Date(emittedAtMs).toISOString();
     if (method === "view/gap") {
       this.needsResync = true;
@@ -164,8 +161,6 @@ export class SessionProjection {
       this.state.unknownEvents = [...this.state.unknownEvents.slice(-49), { method, viewCursor: string(params.viewCursor) }];
     }
 
-    this.touchTurn(method, params, emittedAtMs ?? Date.now());
-
     if (!replay) this.publish(method, params, emittedAtMs);
   }
 
@@ -180,7 +175,23 @@ export class SessionProjection {
   markStopping(turnId: string) { this.state.stoppingTurnId = turnId; this.publish("morti/turnStopping", { turnId }); }
   disconnect() { this.state.connection = "disconnected"; this.publish("morti/hostDisconnected", {}); }
 
+  // Keep the journal, revision and listeners bound to this session across resync.
+  restore(source: SessionProjection) {
+    this.session = source.session;
+    this.state = source.state;
+    this.itemOrder = source.itemOrder;
+    this.itemsById = source.itemsById;
+    this.turnsById = source.turnsById;
+    this.approvals = source.approvals;
+    this.userInputs = source.userInputs;
+    this.seenCursors = source.seenCursors;
+    this.readOnly = source.readOnly;
+    this.needsResync = source.needsResync;
+    this.publish("morti/resynced", {});
+  }
+
   eventsAfter(afterRevision: number) {
+    if (afterRevision > this.revision) return null;
     const oldest = this.journal[0]?.revision ?? this.revision + 1;
     if (afterRevision < oldest - 1) return null;
     return this.journal.filter((event) => event.revision > afterRevision);
@@ -191,50 +202,7 @@ export class SessionProjection {
     return () => this.listeners.delete(listener);
   }
 
-  markStaleTurns(nowMs = Date.now(), maxSilenceMs = STALE_TURN_SILENCE_MS): string[] {
-    // Staleness is only meaningful when no live host can still terminal the
-    // turn. A connected host goes quiet all the time (long tool executions
-    // emit nothing between item/started and item/completed, reasoning is
-    // never streamed), so marking there would false-positive on healthy
-    // turns — and since release()'s busy-check reads snapshot(), a false
-    // stale would unsubscribe the live view, guaranteeing no terminal ever
-    // arrives (self-fulfilling). Gate on disconnection instead.
-    if (this.state.connection === "connected") return [];
-    // A turn blocked on pending approvals/inputs is waiting on the user, not
-    // on a dead host. Never stale those: clearing activeTurnId there would let
-    // the user start a duplicate turn behind the pending request.
-    if (this.approvals.size > 0 || this.userInputs.size > 0) return [];
-    const marked: string[] = [];
-    const staleReason = "Muse went silent on this turn for over two minutes. It will not resume on its own — resend the prompt to retry.";
-    for (const [turnId, turn] of this.turnsById) {
-      if (turn.state !== "running" || !this.isTurnSilent(turnId, nowMs, maxSilenceMs)) continue;
-      this.turnsById.set(turnId, { ...turn, state: "stale", reason: turn.reason ?? staleReason });
-      marked.push(turnId);
-    }
-    const active = this.state.activeTurnId;
-    if (active && (this.turnsById.get(active)?.state === "stale" ||
-        (!this.turnsById.has(active) && this.isTurnSilent(active, nowMs, maxSilenceMs)))) {
-      if (!this.turnsById.has(active)) {
-        this.turnsById.set(active, { turnId: active, state: "stale", reason: staleReason });
-        marked.push(active);
-      }
-      this.state.activeTurnId = null;
-    }
-    if (this.state.stoppingTurnId && marked.includes(this.state.stoppingTurnId)) this.state.stoppingTurnId = null;
-    if (marked.length > 0) {
-      // Journal the transition so SSE clients observe it: a silent mutation
-      // would leave event-stream readers believing they are current while
-      // pollers see a stale turn. A late terminal still folds over the marker
-      // via apply().
-      this.publish("morti/turnStale", { turnIds: marked });
-    }
-    return marked;
-  }
-
   snapshot(): SessionProjectionSnapshot {
-    // Lazy so every reader (bridge summary, event stream, client) applies the
-    // same rule with no caller changes.
-    this.markStaleTurns();
     return {
       revision: this.revision,
       readOnly: this.readOnly,
@@ -254,36 +222,6 @@ export class SessionProjection {
     if (prior && nextRevision < priorRevision) return;
     if (!prior) this.itemOrder.push(id);
     this.itemsById.set(id, { ...(prior ?? {}), ...item });
-  }
-
-  private touchTurn(method: string, params: Record<string, unknown>, atMs: number) {
-    // Direct turn refs only come from turn/* and item/* events. Anything else
-    // (approvals, usage, todos) still proves the active turn's host is alive.
-    if (method.startsWith("turn/") || method.startsWith("item/")) {
-      const turnId = string(params.turnId) ?? string(asRecord(params.item)?.turnId) ?? this.turnIdForItem(string(params.itemId));
-      if (turnId) this.turnLastEventAtMs.set(turnId, atMs);
-    }
-    const active = this.state.activeTurnId;
-    if (active) {
-      const prior = this.turnLastEventAtMs.get(active);
-      if (prior === undefined || atMs >= prior) this.turnLastEventAtMs.set(active, atMs);
-    }
-  }
-
-  private turnIdForItem(itemId: string | undefined): string | undefined {
-    if (!itemId) return undefined;
-    const turnId = this.itemsById.get(itemId)?.turnId;
-    return typeof turnId === "string" ? turnId : undefined;
-  }
-
-  private isTurnSilent(turnId: string, nowMs: number, maxSilenceMs: number): boolean {
-    const last = this.turnLastEventAtMs.get(turnId);
-    if (last !== undefined) return nowMs - last > maxSilenceMs;
-    // No event ever named this turn (e.g. activeTurnId restored from a read
-    // with no replayed history): fall back to the session clock, and stay
-    // conservative when that is missing or unparseable.
-    const updatedAt = Date.parse(String(this.session.updatedAt ?? ""));
-    return Number.isFinite(updatedAt) && nowMs - updatedAt > maxSilenceMs;
   }
 
   private applyDelta(params: Record<string, unknown>) {

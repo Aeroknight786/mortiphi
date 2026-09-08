@@ -54,6 +54,9 @@ export class MuseBridge {
   private quarantined = new Map<string, string>();
   private readOnlyIds = new Set<string>();
   private pendingReattach = new Set<string>();
+  private attaching = new Map<string, Promise<SessionProjection>>();
+  private buffered = new Map<string, Array<{ method: string; params: Json; emittedAtMs?: number }>>();
+  private uncertainSends = new Map<string, { commandId: string; error: AppError }>();
   private stderr: string[] = [];
   private options: Required<BridgeOptions>;
   private labels: SessionLabelStore;
@@ -68,7 +71,7 @@ export class MuseBridge {
       labelStorePath: options.labelStorePath ?? process.env.MORTIPHI_LABEL_STORE ?? join(homedir(), ".mortiphi", "session-labels.json"),
       visibilityStorePath: options.visibilityStorePath ?? process.env.MORTIPHI_VISIBILITY_STORE ?? join(homedir(), ".mortiphi", "hidden-sessions.json"),
       titleStorePath: options.titleStorePath ?? process.env.MORTIPHI_TITLE_STORE ?? join(homedir(), ".mortiphi", "session-titles.json"),
-      trustWorkspace: options.trustWorkspace ?? process.env.MORTIPHI_TRUST_WORKSPACE !== "0",
+      trustWorkspace: options.trustWorkspace ?? process.env.MORTIPHI_TRUST_WORKSPACE === "1",
       spawnHost: options.spawnHost ?? spawnMspConnection,
     };
     this.labels = new SessionLabelStore(this.options.labelStorePath);
@@ -89,9 +92,7 @@ export class MuseBridge {
       await Promise.all([this.labels.load(), this.visibility.load(), this.titles.load()]);
       const handshake = this.options.spawnHost({
         command: this.options.museBin,
-        // Subagent tools (subagent_spawn, …) only enter the model toolset when the host trusts the
-        // workspace; otherwise the model falls back to the workflow tool, whose launcher MSP clients
-        // cannot install, so delegation always fails. Opt out with MORTIPHI_TRUST_WORKSPACE=0.
+        // Trust loads every session workspace's skills and rules. Explicit opt-in only.
         args: this.options.trustWorkspace ? ["serve", "--trust-workspace"] : ["serve"],
         cwd: this.options.cwd,
         onStderr: (chunk) => {
@@ -109,12 +110,18 @@ export class MuseBridge {
         throw new AppError("unsupported_envelope", `Muse returned MSP envelope v${unsupportedVersion}.`, 503, false, "Install a Muse release that supports MSP envelope v1.");
       }
       host.connection.onNotification((notification) => {
+        if (this.host !== host) return;
         const params = asJson(notification.params);
         const sessionId = typeof params.sessionId === "string" ? params.sessionId : null;
-        if (sessionId) this.projections.get(sessionId)?.apply(notification.method, params, notification.emittedAtMs);
+        if (sessionId) {
+          const buffer = this.buffered.get(sessionId);
+          if (buffer) buffer.push({ method: notification.method, params, emittedAtMs: notification.emittedAtMs });
+          else this.projections.get(sessionId)?.apply(notification.method, params, notification.emittedAtMs);
+        }
       });
-      host.connection.closed.then(() => this.onHostClosed("closed")).catch(() => undefined);
-      host.exited.then((exit) => { this.lastExit = exit; }).catch(() => undefined);
+      host.connection.closed.then(() => { if (this.host === host) this.onHostClosed("closed"); }).catch(() => undefined);
+      host.exited.then((exit) => { if (this.host === host) this.lastExit = exit; }).catch(() => undefined);
+      if (this.shutdown) { await host.close(); return; }
       this.host = host;
     })();
     try {
@@ -129,7 +136,9 @@ export class MuseBridge {
       if (!this.shutdown) this.scheduleReconnect();
       return;
     }
+    const retired = this.host;
     this.host = undefined;
+    if (retired) void retired.close().catch(() => undefined);
     for (const projection of this.projections.values()) projection.disconnect();
     // In-flight pins are NOT cleared here: their owning sends are still
     // settling through catch/finally, and reconcile needs the steer pin to
@@ -146,7 +155,7 @@ export class MuseBridge {
   }
 
   private scheduleReconnect() {
-    if (this.shutdown || this.host || this.connecting || this.reconnectTimer) return;
+    if (this.shutdown || (this.host && !this.pendingReattach.size) || this.connecting || this.reconnectTimer) return;
     const delay = Math.min(15_000, 1000 * 2 ** Math.min(this.reconnectAttempt, 3));
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = undefined;
@@ -177,9 +186,13 @@ export class MuseBridge {
       try {
         await this.attach(sessionId);
       } catch (error) {
-        this.recordFailure(sessionId, "session/resume", error instanceof AppError ? error : transportError(error, "session/resume"), messageFrom(error));
+        const failure = error instanceof AppError ? error : transportError(error, "session/resume");
+        this.recordFailure(sessionId, "session/resume", failure, messageFrom(error));
+        if (failure.retryable) this.pendingReattach.add(sessionId);
       }
     }
+    if (this.pendingReattach.size) { this.reconnectAttempt += 1; this.scheduleReconnect(); }
+    else this.reconnectAttempt = 0;
   }
 
   private async ensureHost() {
@@ -319,14 +332,18 @@ export class MuseBridge {
 
   async attach(sessionId: string, force = false) {
     this.assertVisible(sessionId);
-    if (force) {
-      this.retain(sessionId);
-      this.subscribed.delete(sessionId);
-      this.projections.delete(sessionId);
-      this.readOnlyIds.delete(sessionId);
-    }
+    const pending = this.attaching.get(sessionId);
+    if (pending) return pending;
+    const operation = this.attachSession(sessionId, force);
+    this.attaching.set(sessionId, operation);
+    try { return await operation; }
+    finally { this.attaching.delete(sessionId); }
+  }
+
+  private async attachSession(sessionId: string, force: boolean) {
+    this.retain(sessionId);
     const existing = this.projections.get(sessionId);
-    if (existing && !existing.needsResync && !existing.readOnly && this.subscribed.has(sessionId)) return existing;
+    if (!force && existing && !existing.needsResync && !existing.readOnly && this.subscribed.has(sessionId)) return existing;
     let read: Json;
     try {
       read = await this.request("session/read", { sessionId, excludeItems: false });
@@ -336,62 +353,70 @@ export class MuseBridge {
       throw error;
     }
     const session = asJson(read.session);
-    const projection = existing && !force ? existing : new SessionProjection(session, this.options.maxJournal);
-    projection.readOnly = false;
-    if (existing && !force) {
+    const projection = new SessionProjection(session, this.options.maxJournal);
+    if (existing) {
       // Only tear down a view this host actually holds. After a host death the
       // claim is already queued for re-attach, and unsubscribing on a fresh
       // host just manufactures a failure record.
       if (this.subscribed.has(sessionId)) await this.request("view/unsubscribe", { sessionId }).catch(() => undefined);
-      projection.reset(session);
     }
-    await this.hydrateHistory(projection, sessionId, asJson(read.history));
-    this.projections.set(sessionId, projection);
-    // No cursor. `read.viewCursor` is session/read's durable-log fold head, and
-    // session/resume only accepts "a view cursor previously observed by this
-    // client" on a live view — muse rejects the fold head with -32011 notFound
-    // ("unknown cursor anchor") whenever this host already holds the session,
-    // which is every re-attach. Its only documented effect is trimming resume's
-    // history payload, and `excludeItems` already does that, so dropping it
-    // costs nothing. Tradeoff: events landing between the read above and this
-    // resume are not replayed (we subscribe at the resume head); closing that
-    // window means hydrating from the resume result instead of the read.
+    this.subscribed.delete(sessionId);
+    const buffer: Array<{ method: string; params: Json; emittedAtMs?: number }> = [];
+    this.buffered.set(sessionId, buffer);
+    let resumedSuccessfully = false;
     try {
-      const resumed = await this.command("session/resume", { sessionId, excludeItems: true });
+      const resumed = await this.command("session/resume", { sessionId, excludeItems: false });
+      resumedSuccessfully = true;
+      const host = this.host;
       const resumedSession = asJson(resumed.session);
-      if (typeof resumedSession.sessionId === "string") projection.session = { ...projection.session, ...resumedSession };
+      projection.reset({ ...session, ...resumedSession });
+      await this.hydrateHistory(projection, sessionId, asJson(resumed.history));
+      const pending = await this.request("approval/listPending", { sessionId });
+      projection.replacePending(pending);
+      if (host !== this.host) throw new AppError("muse_unavailable", "Connection changed while restoring this task.", 503, true, "Reconnecting automatically.");
+      for (const event of buffer) projection.apply(event.method, event.params, event.emittedAtMs);
     } catch (error) {
+      // Pending/history failures must be retried; only a definitive resume
+      // rejection permits falling back to a stored read-only transcript.
       const failure = error instanceof AppError ? error : transportError(error, "session/resume");
       if (failure.category === "gone") {
         this.quarantined.set(sessionId, failure.message);
         this.projections.delete(sessionId);
         throw error;
       }
-      if (failure.retryable) throw error;
+      if (failure.retryable || resumedSuccessfully) {
+        existing?.disconnect();
+        this.pendingReattach.add(sessionId);
+        this.scheduleReconnect();
+        throw error;
+      }
       // Muse can read this session but not resume it (e.g. a log it wrote but
       // can no longer fold). Open read-only from the read above instead of
       // throwing: the transcript stays viewable, writes are blocked.
       projection.readOnly = true;
+      projection.reset(session);
+      await this.hydrateHistory(projection, sessionId, asJson(read.history));
       this.readOnlyIds.add(sessionId);
       this.quarantined.delete(sessionId);
       this.recordFailure(sessionId, "session/resume", failure, messageFrom(error));
       logBridge("session_readonly", { sessionId, kind: failure.museKind ?? null, code: failure.museCode ?? null });
       this.titles.set(sessionId, deriveTitle(projection.snapshot().items));
-      return projection;
+      if (existing) existing.restore(projection);
+      const result = existing ?? projection;
+      this.projections.set(sessionId, result);
+      return result;
+    } finally {
+      this.buffered.delete(sessionId);
     }
     this.subscribed.add(sessionId);
     this.readOnlyIds.delete(sessionId);
     this.quarantined.delete(sessionId);
-    try {
-      const pending = await this.request("approval/listPending", { sessionId });
-      projection.replacePending(pending);
-    } catch (error) {
-      // Pending approvals are additive. Losing them must not fail the open.
-      const failure = error instanceof AppError ? error : transportError(error, "approval/listPending");
-      this.recordFailure(sessionId, "approval/listPending", failure, messageFrom(error));
-    }
+    if (existing) existing.restore(projection);
+    const result = existing ?? projection;
+    this.projections.set(sessionId, result);
+    this.pendingReattach.delete(sessionId);
     this.titles.set(sessionId, deriveTitle(projection.snapshot().items));
-    return projection;
+    return result;
   }
 
   async fork(sessionId: string) {
@@ -441,6 +466,7 @@ export class MuseBridge {
   async startTurn(sessionId: string, input: TurnInputPart[], effort: ReasoningEffort, ifBusy: string) {
     return this.withSessionLoaded(sessionId, async (projection) => {
       this.assertWritable(projection, sessionId);
+      this.assertSubmissionResolved(sessionId, projection);
       // Pin one client-minted commandId per send so a drop mid-send can be
       // reconciled against the admitted turn instead of re-issued as a dup.
       const commandId = this.mintCommandId();
@@ -461,6 +487,7 @@ export class MuseBridge {
   async steer(sessionId: string, expectedTurnId: string, input: TurnInputPart[], effort?: ReasoningEffort) {
     return this.withSessionLoaded(sessionId, async (projection) => {
       this.assertWritable(projection, sessionId);
+      this.assertSubmissionResolved(sessionId, projection);
       const commandId = this.mintCommandId();
       this.trackInFlight(sessionId, commandId);
       // A steer carries no new turnId (its input is absorbed into the running
@@ -517,6 +544,7 @@ export class MuseBridge {
   release(sessionId: string) {
     this.retain(sessionId);
     const timer = setTimeout(() => {
+      this.releaseTimers.delete(sessionId);
       const snapshot = this.projections.get(sessionId)?.snapshot();
       const busy = snapshot && (snapshot.state.activeTurnId || snapshot.state.queuedTurns.length || snapshot.pending.approvals.length || snapshot.pending.userInputs.length);
       if (busy || !this.subscribed.has(sessionId)) return;
@@ -546,6 +574,13 @@ export class MuseBridge {
     }
   }
 
+  private assertSubmissionResolved(sessionId: string, projection: SessionProjection) {
+    const uncertain = this.uncertainSends.get(sessionId);
+    if (!uncertain) return;
+    if (this.findAdmittedTurnId(projection, uncertain.commandId)) this.uncertainSends.delete(sessionId);
+    else throw uncertain.error;
+  }
+
   async close() {
     this.shutdown = true;
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
@@ -558,6 +593,7 @@ export class MuseBridge {
     this.subscribed.clear();
     if (this.host) await this.host.close();
     this.host = undefined;
+    await this.titles.flush();
   }
 
   private async refreshProjection(sessionId: string, projection: SessionProjection) {
@@ -617,7 +653,7 @@ export class MuseBridge {
       workspaceRoot: root,
       title: this.labels.get(id) ?? (projection ? deriveTitle(projection.items) : this.titles.get(id) ?? "Untitled task"),
       titleSource: this.labels.get(id) ? "mortiphi" : "prompt",
-      status: active || rawStatus === "running" ? "running" : queued ? "queued" : pending ? "waiting" : "idle",
+      status: projection?.state.connection === "disconnected" ? "reconnecting" : active || rawStatus === "running" ? "running" : queued ? "queued" : pending ? "waiting" : "idle",
       activeTurnId: active,
       modelId: text(session.modelId) ?? null,
       providerId: text(session.providerId) ?? null,
@@ -634,18 +670,20 @@ export class MuseBridge {
 
   private async request(method: string, params: Json, silent = false): Promise<Json> {
     await this.ensureHost();
+    const host = this.host;
     try {
       return await this.connection.request(method, params);
     } catch (error) {
-      throw this.noteFailure(method, params, error, silent);
+      throw this.noteFailure(method, params, error, silent, host);
     }
   }
   private async command(method: string, params: Json, options?: CommandOptions): Promise<Json> {
     await this.ensureHost();
+    const host = this.host;
     try {
       return await this.connection.command(method, params, options);
     } catch (error) {
-      throw this.noteFailure(method, params, error);
+      throw this.noteFailure(method, params, error, false, host);
     }
   }
 
@@ -677,7 +715,7 @@ export class MuseBridge {
     if (!isUnknownOutcome(error)) throw error;
     // Reconcile before any resend: if Muse already took this commandId,
     // surfacing that beats re-issuing it as a duplicate.
-    const admittedInMemory = this.findAdmittedTurnId(projection, commandId) ?? this.steerCommands.get(commandId);
+    const admittedInMemory = this.findAdmittedTurnId(projection, commandId);
     if (admittedInMemory) throw this.unknownTurnOutcome(sessionId, method, commandId, admittedInMemory, error, outcome);
     // Always attempt the metadata leg: sampling connectedness before the send
     // misses the reconnect race (down at capture, transmitted before the ack
@@ -688,14 +726,17 @@ export class MuseBridge {
     try {
       const read = await this.request("session/read", { sessionId, excludeItems: true }, true);
       const active = text(asJson(read.session).activeTurnId);
-      if (active && (active === commandId || active !== priorActive)) {
+      if (active === commandId) {
         throw this.unknownTurnOutcome(sessionId, method, commandId, active, error, outcome);
       }
     } catch (readError) {
       if (readError instanceof AppError && readError.code === "turn_unknown_outcome") throw readError;
       // Best-effort: a failed reconcile must not mask the original failure.
     }
-    throw error;
+    const unresolved = new AppError("turn_unknown_outcome", "The connection dropped before this submission could be confirmed.", 409, false,
+      "Choose Refresh task in the task menu to check the original submission. Sending is paused until it is confirmed; you can fork to continue with a different request.");
+    this.uncertainSends.set(sessionId, { commandId, error: unresolved });
+    throw unresolved;
   }
 
   private findAdmittedTurnId(projection: SessionProjection, commandId: string): string | undefined {
@@ -708,6 +749,9 @@ export class MuseBridge {
     }
     for (const queued of snapshot?.state.queuedTurns ?? []) {
       if ((queued.commandId === commandId || queued.turnId === commandId) && typeof queued.turnId === "string") return queued.turnId;
+    }
+    for (const item of snapshot?.items ?? []) {
+      if ((item.commandId === commandId || item.turnId === commandId) && typeof item.turnId === "string") return item.turnId;
     }
     return undefined;
   }
@@ -730,7 +774,7 @@ export class MuseBridge {
     return failure;
   }
 
-  private noteFailure(method: string, params: Json, error: unknown, silent = false): AppError {
+  private noteFailure(method: string, params: Json, error: unknown, silent = false, host = this.host): AppError {
     const raw = messageFrom(error);
     // Already classified (a previous transportError, or a hand-built AppError
     // carrying kind/category): re-wrapping would discard the kind, category,
@@ -745,7 +789,7 @@ export class MuseBridge {
     // A transport-level failure under a live claim means the host died beneath
     // us (possibly before `connection.closed` fires). Drop the claim so the
     // supervised respawn takes over instead of serving a dead connection.
-    if (/closed|transport|EPIPE|ECONNRESET|not connected/i.test(raw) && this.host) {
+    if (/closed|transport|EPIPE|ECONNRESET|not connected/i.test(raw) && host && this.host === host) {
       this.onHostClosed(`transport:${method}`);
     }
     // Silent reads are best-effort probes (reconcile): recording them would
@@ -774,14 +818,10 @@ function logBridge(event: string, fields: Record<string, unknown> = {}) {
   console.error(JSON.stringify({ ts: new Date().toISOString(), component: "muse-bridge", event, ...fields }));
 }
 function isUnknownOutcome(error: unknown) {
-  // Retryable means the operation's outcome is uncertain by construction: the
-  // ack never arrived (transport) or the server explicitly allows retry
-  // (overloaded, sessionNotLoaded, internal). Definitive rejections
-  // (commandRejected and friends) and sends that never transmitted
-  // (muse_unavailable) are not worth reconciling. Reconcile-first is safe
-  // even for pre-intake rejections: a read that finds nothing rethrows the
-  // original error untouched.
+  // Known pre-admission rejections can be retried. Transport failures remain
+  // uncertain even when a metadata read cannot find an active turn.
   if (!(error instanceof AppError)) return true;
+  if (isSessionNotLoaded(error) || ["overloaded", "backpressured"].includes(error.museKind ?? "")) return false;
   if (error.code === "muse_unavailable") return false;
   if (error.code !== "muse_operation_failed") return false;
   return error.retryable === true;

@@ -54,9 +54,9 @@ export function museIdentity(error: unknown): { code?: number; kind?: string; re
 
 export function classifyMuseError(error: unknown): { category: FailureCategory; retryable: boolean; kind?: string; code?: number } {
   const { code, kind, retryable } = museIdentity(error);
+  if (kind && GONE_KINDS.has(kind)) return { category: "gone", retryable: false, kind, code };
   if (typeof retryable === "boolean") return { category: retryable ? "transient" : "readable", retryable, kind, code };
   if (kind && TRANSIENT_KINDS.has(kind)) return { category: "transient", retryable: true, kind, code };
-  if (kind && GONE_KINDS.has(kind)) return { category: "gone", retryable: false, kind, code };
   if (kind === "sessionNotLoaded") return { category: "readable", retryable: true, kind, code };
   const message = messageFrom(error);
   if (/timeout|closed|transport|ECONNRESET|EPIPE|not connected|not initialized/i.test(message)) {

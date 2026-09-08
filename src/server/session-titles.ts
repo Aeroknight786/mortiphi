@@ -26,6 +26,8 @@ export class SessionTitleStore {
 
   get(sessionId: string) { return this.titles.get(sessionId); }
 
+  async flush() { await this.pendingSave; }
+
   set(sessionId: string, title: string) {
     if (!title.trim() || this.titles.get(sessionId) === title) return;
     this.titles.set(sessionId, title);

@@ -28,9 +28,9 @@ function stubbedBridge() {
 }
 
 describe("MuseBridge trustWorkspace", () => {
-  it("trusts the workspace host by default", () => {
+  it("does not trust the workspace host by default", () => {
     const bridge = new MuseBridge({});
-    expect((bridge as unknown as { options: { trustWorkspace: boolean } }).options.trustWorkspace).toBe(true);
+    expect((bridge as unknown as { options: { trustWorkspace: boolean } }).options.trustWorkspace).toBe(false);
   });
 
   it("honors MORTIPHI_TRUST_WORKSPACE=0 and explicit options", () => {
@@ -189,7 +189,7 @@ describe("failure taxonomy", () => {
 describe("MuseBridge host supervision", () => {
   it("drops the host claim on close so later requests reconnect instead of serving death", async () => {
     const bridge = new MuseBridge({ titleStorePath: tmpTitles() });
-    (bridge as unknown as { host: unknown }).host = { connection: {} };
+    (bridge as unknown as { host: unknown }).host = { connection: {}, close: async () => {} };
     expect(bridge.isConnected()).toBe(true);
     (bridge as unknown as { onHostClosed(reason: string): void }).onHostClosed("test");
     expect(bridge.isConnected()).toBe(false);
@@ -558,7 +558,7 @@ describe("MuseBridge idempotent turn resend", () => {
     const second = idempotentFakeHost({
       mint,
       onSessionRead: () => ({
-        session: { sessionId: "S", workspaceRoot: "/tmp", createdAt: "", updatedAt: "", turnCount: 1, activeTurnId: "t-from-read" },
+        session: { sessionId: "S", workspaceRoot: "/tmp", createdAt: "", updatedAt: "", turnCount: 1, activeTurnId: admittedCommandId },
         history: {
           mode: "inline",
           items: [{ itemId: "i9", kind: "userMessage", text: "Hello there", turnId: "t-from-read", commandId: admittedCommandId }],
@@ -579,7 +579,7 @@ describe("MuseBridge idempotent turn resend", () => {
     // bridge must consult session state before deciding not to resend.
     const error = await bridge.startTurn("S", [{ type: "text", text: "hi" }], "none", "queue").catch((cause) => cause);
     expect(error).toMatchObject({ code: "turn_unknown_outcome", retryable: false });
-    expect(String(error.message)).toContain("t-from-read");
+    expect(String(error.message)).toContain(admittedCommandId);
     expect(first.turnSends).toHaveLength(1);
     expect(second.turnSends).toHaveLength(0);
     expect(spawns).toBe(2);
@@ -587,7 +587,7 @@ describe("MuseBridge idempotent turn resend", () => {
     await bridge.close();
   });
 
-  it("surfaces a genuinely unadmitted drop as retryable and retries with a fresh key", async () => {
+  it("blocks fresh sends when a dropped submission cannot be confirmed", async () => {
     const mint = sharedMint();
     let sends = 0;
     const fakes: Array<ReturnType<typeof idempotentFakeHost>> = [];
@@ -609,12 +609,11 @@ describe("MuseBridge idempotent turn resend", () => {
     await bridge.initialize();
 
     const error = await bridge.startTurn("S", [{ type: "text", text: "hi" }], "none", "queue").catch((cause) => cause);
-    expect(error).toMatchObject({ code: "muse_operation_failed", retryable: true });
+    expect(error).toMatchObject({ code: "turn_unknown_outcome", retryable: false });
 
-    const result = await bridge.startTurn("S", [{ type: "text", text: "hi" }], "none", "queue");
-    expect(result.turnId).toBe("t-2");
+    await expect(bridge.startTurn("S", [{ type: "text", text: "hi" }], "none", "queue")).rejects.toMatchObject({ code: "turn_unknown_outcome" });
     const keys = fakes.flatMap((fake) => fake.turnSends.map((send) => send.options?.commandId));
-    expect(keys).toEqual(["cmd-1", "cmd-2"]);
+    expect(keys).toEqual(["cmd-1"]);
     expect(inFlightSize(bridge)).toBe(0);
     await bridge.close();
   });
@@ -695,7 +694,7 @@ describe("MuseBridge reconcile review fixes", () => {
     return error;
   }
 
-  it("names the absorbed turn for steer with non-retryable wording", async () => {
+  it("does not claim that a steer target proves acceptance", async () => {
     const fake = reconcileFake({
       onCommand: async (method) => {
         if (method === "turn/steer") throw new Error("transport closed unexpectedly");
@@ -706,8 +705,8 @@ describe("MuseBridge reconcile review fixes", () => {
     await bridge.initialize();
     const error = await bridge.steer("S", "t-run", [{ type: "text", text: "nudge" }], "none").catch((cause) => cause);
     expect(error).toMatchObject({ code: "turn_unknown_outcome", retryable: false });
-    expect(String(error.message)).toContain("t-run");
-    expect(String(error.message)).toContain("absorbed");
+    expect(String(error.message)).toContain("could be confirmed");
+    expect(String(error.message)).not.toContain("absorbed");
     await bridge.close();
   });
 
@@ -754,7 +753,7 @@ describe("MuseBridge reconcile review fixes", () => {
     const bridge = reconcileBridge(fake);
     await bridge.initialize();
     const error = await bridge.startTurn("S", [{ type: "text", text: "hi" }], "none", "queue").catch((cause) => cause);
-    expect(error).toMatchObject({ code: "muse_operation_failed", retryable: true });
+    expect(error).toMatchObject({ code: "turn_unknown_outcome", retryable: false });
     await bridge.close();
   });
 
@@ -778,7 +777,7 @@ describe("MuseBridge reconcile review fixes", () => {
     const bridge = reconcileBridge(fake);
     await bridge.initialize();
     const error = await bridge.startTurn("S", [{ type: "text", text: "hi" }], "none", "queue").catch((cause) => cause);
-    expect(error).toMatchObject({ code: "muse_operation_failed" });
+    expect(error).toMatchObject({ code: "turn_unknown_outcome" });
     expect(bridge.health().failures[0]).toMatchObject({ sessionId: "S", method: "turn/start" });
     await bridge.close();
   });
