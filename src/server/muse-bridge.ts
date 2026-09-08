@@ -365,9 +365,11 @@ export class MuseBridge {
     this.buffered.set(sessionId, buffer);
     let resumedSuccessfully = false;
     try {
+      await this.ensureHost();
+      const host = this.host;
       const resumed = await this.command("session/resume", { sessionId, excludeItems: false });
       resumedSuccessfully = true;
-      const host = this.host;
+      if (host !== this.host) throw new AppError("muse_unavailable", "Connection changed while restoring this task.", 503, true, "Reconnecting automatically.");
       const resumedSession = asJson(resumed.session);
       projection.reset({ ...session, ...resumedSession });
       await this.hydrateHistory(projection, sessionId, asJson(resumed.history));

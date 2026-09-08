@@ -190,6 +190,23 @@ describe("PR recovery regressions", () => {
     expect(projection.snapshot().state.connection).toBe("connected");
   });
 
+  it("rejects a resume response from a host replaced before its acknowledgement arrives", async () => {
+    let bridge: MuseBridge;
+    const first = fake(async method => {
+      if (method === "session/resume") {
+        first.end();
+        await Promise.resolve();
+        await bridge.initialize();
+        return { session, history };
+      }
+      return {};
+    });
+    ({ bridge } = await bridgeFor([first, fake()]));
+    await expect(bridge.attach("S")).rejects.toMatchObject({ code: "muse_unavailable" });
+    expect(bridge.health().subscriptions).toBe(0);
+    expect(bridge.health().pendingReattach).toContain("S");
+  });
+
   it("requests a new snapshot when a browser reconnects with an earlier server's revision", async () => {
     const { bridge } = await bridgeFor([fake()]);
     const projection = await bridge.attach("S");
